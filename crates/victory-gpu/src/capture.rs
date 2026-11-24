@@ -511,6 +511,37 @@ fn dump_stencil(
             "listed frame: stencil values (value, pixels; most first)"
         );
     }
+    // A 24-bit depth plane's raw values counted too: a pass that tests
+    // depth for equality (the tiled lighting against the material depth)
+    // can then be compared with what the plane really holds.
+    if matches!(d.Format.0, 44 | 45)
+        && let Some((f0, rows0)) = read_rows(host, texture, state, 0)
+        && matches!(f0.Format.0, 39..=47)
+    {
+        let (w0, h0, p0) = (f0.Width as usize, f0.Height as usize, f0.RowPitch as usize);
+        let mut seen = std::collections::HashMap::<u32, u32>::new();
+        for y in 0..h0 {
+            for x in 0..w0 {
+                let o = y * p0 + x * 4;
+                if let Some(b) = rows0.get(o..o + 4) {
+                    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x00ff_ffff;
+                    *seen.entry(v).or_default() += 1;
+                }
+            }
+        }
+        let distinct = seen.len();
+        let mut counts: Vec<(u32, u32)> = seen.into_iter().collect();
+        counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        counts.truncate(48);
+        tracing::info!(
+            frame,
+            index = i,
+            ?resource,
+            distinct,
+            counts = ?counts,
+            "listed frame: 24-bit depth values (raw value, pixels; most first)"
+        );
+    }
     let Some(rgba) = to_rgba(f.Format.0 as u32, w, h, pitch, &rows) else {
         tracing::info!(frame, index = i, ?resource, footprint = f.Format.0, "listed frame: stencil not dumped: format");
         return;

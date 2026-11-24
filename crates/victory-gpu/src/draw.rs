@@ -1680,10 +1680,22 @@ impl State {
             .map(|r| format!("{},{}..{},{}", r.left, r.top, r.right, r.bottom))
             .collect();
         let (pipeline, host) = crate::pipeline::describe(self.pipeline as This);
+        // The first record as title memory holds it now (what the GPU wrote
+        // there comes back after each submission): counts of zero say the
+        // pass that fills the records did not.
+        let record: Vec<u32> = if crate::shadow::find(arguments, 16).is_some() {
+            (0..4u64)
+                // SAFETY: sixteen bytes of a title buffer the shadow table knows.
+                .map(|i| unsafe { std::ptr::read_unaligned((arguments + i * 4) as *const u32) })
+                .collect()
+        } else {
+            Vec::new()
+        };
         tracing::info!(
             frame,
             kind,
             ran,
+            record = ?record,
             pipeline = %pipeline,
             host_pipeline = %host,
             topology = self.topology,
