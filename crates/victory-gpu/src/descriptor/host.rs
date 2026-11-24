@@ -1092,6 +1092,26 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
             flags = d.Flags.0,
             "view the host does not allow"
         );
+        // Each kind of refused view once (diagnostics builds): which
+        // textures the title reads or writes in a way the host cannot.
+        #[cfg(feature = "diagnostics")]
+        {
+            static SEEN: std::sync::Mutex<Vec<(bool, u32, i32, u64, u32)>> =
+                std::sync::Mutex::new(Vec::new());
+            let key = (unordered, own, d.Flags.0, d.Width, d.Height);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&key) && seen.len() < 256 {
+                seen.push(key);
+                tracing::warn!(
+                    unordered,
+                    format = own,
+                    flags = d.Flags.0,
+                    width = d.Width,
+                    height = d.Height,
+                    "view the host does not allow: first of this kind and size"
+                );
+            }
+        }
         return false;
     }
     // Every family has more than one format, its typeless one first.

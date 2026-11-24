@@ -436,12 +436,37 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// One line per copy into a texture in a frame listed for capture: both
+/// resources as the dump file names print them (diagnostics builds). Says
+/// which textures are filled by copies rather than by draws.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn log_texture_copy(what: &str, dst: This, src: This) {
+    let frame = crate::queue::presented() + 1;
+    if !crate::capture::listed(frame)
+        || (crate::resource::host_resource(dst).is_none()
+            && crate::resource::host_resource(src).is_none())
+    {
+        return;
+    }
+    let text = |r: This| match crate::resource::host_resource(r) {
+        Some(t) => {
+            // SAFETY: a live resource.
+            let d = unsafe { t.GetDesc() };
+            format!("{r:?} {}x{} f{}", d.Width, d.Height, d.Format.0)
+        }
+        None => format!("{r:?} (a buffer)"),
+    };
+    tracing::info!(frame, what, dst = %text(dst), src = %text(src), "listed frame: texture copy");
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        log_texture_copy("resource", dst, src);
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -506,6 +531,8 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        log_texture_copy("region", dst.resource, src.resource);
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
