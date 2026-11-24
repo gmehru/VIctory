@@ -1,32 +1,84 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size, and so are the frames [`listed`] by number or by how far they come
+//! after the first world frame. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 /// The folder frames go to, if capturing.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
-    static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
     FOLDER
         .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
         .as_ref()
 }
 
-/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated), and those
+/// `VICTORY_CAPTURE_AFTER` (comma-separated offsets) puts after the first
+/// world frame ([`presenting`]): saved too, and their draws traced at
+/// debug level.
 pub(crate) fn listed(n: u64) -> bool {
-    static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_FRAMES").unwrap_or_default();
-        list.split(',')
-            .filter_map(|f| f.trim().parse().ok())
-            .collect()
-    })
-    .contains(&n)
+    static LIST: OnceLock<Vec<u64>> = OnceLock::new();
+    LIST.get_or_init(|| numbers("VICTORY_CAPTURE_FRAMES")).contains(&n)
+        || after_world(n, WORLD.load(Relaxed), offsets())
+}
+
+/// The decimal numbers in variable `name`, comma-separated; what does not
+/// read as one is left out.
+fn numbers(name: &str) -> Vec<u64> {
+    let list = std::env::var(name).unwrap_or_default();
+    list.split(',').filter_map(|f| f.trim().parse().ok()).collect()
+}
+
+/// `VICTORY_CAPTURE_AFTER`'s offsets.
+fn offsets() -> &'static [u64] {
+    static OFFSETS: OnceLock<Vec<u64>> = OnceLock::new();
+    OFFSETS.get_or_init(|| numbers("VICTORY_CAPTURE_AFTER"))
+}
+
+/// The first world frame, once seen (0 before).
+static WORLD: AtomicU64 = AtomicU64::new(0);
+
+/// Draws recorded between two presents from which the second is a world
+/// frame: menu and loading frames record a dozen or so, the world's
+/// thousands (its first frames that many even while most are dropped for
+/// pipelines being made).
+const WORLD_DRAWS: u64 = 200;
+
+/// Whether frame `n` is one of `offsets` after the first world frame
+/// `world` (0: none yet).
+fn after_world(n: u64, world: u64, offsets: &[u64]) -> bool {
+    world != 0 && n >= world && offsets.contains(&(n - world))
+}
+
+/// At the present of frame `frame`, before anything of it is saved: with
+/// `VICTORY_CAPTURE_AFTER`, the first frame since whose previous present at
+/// least [`WORLD_DRAWS`] draws were recorded is the first world frame. Its
+/// own targets were recorded before that was known, so offset 0 saves its
+/// picture only.
+pub(crate) fn presenting(frame: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if folder().is_none() || offsets().is_empty() {
+        return;
+    }
+    let now = crate::list::recorded_draws();
+    let draws = now.saturating_sub(LAST.swap(now, Relaxed));
+    // The first present has no previous one: loading's draws come before.
+    if frame > 1 && draws >= WORLD_DRAWS && WORLD.compare_exchange(0, frame, Relaxed, Relaxed).is_ok() {
+        tracing::info!(
+            frame,
+            draws,
+            offsets = ?offsets(),
+            "first world frame: VICTORY_CAPTURE_AFTER counts from here"
+        );
+    }
 }
 
 /// Whether frame `n` is saved.
@@ -209,7 +261,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
     std::sync::Mutex::new(Vec::new());
 
 fn dump_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
@@ -226,24 +278,88 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
-/// At the present of frame `frame`: saves the noted targets.
+/// How long one frame's dumps may take: they hold the title's render
+/// thread in its present, and the title ends a frame that takes about 30 s.
+const DUMP_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Targets narrower or lower than this are not dumped (tile grids, lookup
+/// tables, probes).
+const DUMP_SMALLEST: u64 = 32;
+
+/// At the present of frame `frame`: saves the noted targets, largest first
+/// (the scene's before small passes'), until [`DUMP_BUDGET`] is spent; file
+/// names keep the first-use order. Logs how many were saved, how long it
+/// took and which one took longest, and which were left out for the budget.
 pub(crate) fn dump_targets(frame: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
+    if !dump_on() {
+        return;
+    }
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy)) in targets.iter().enumerate() {
-        let texture = &copy.texture;
+    let started = std::time::Instant::now();
+    let mut order: Vec<(usize, D3D12_RESOURCE_DESC)> = targets
+        .iter()
         // SAFETY: a live resource.
-        let d = unsafe { texture.GetDesc() };
+        .map(|(_, copy)| unsafe { copy.texture.GetDesc() })
+        .enumerate()
+        .collect();
+    order.sort_by_key(|(i, d)| (std::cmp::Reverse(d.Width * u64::from(d.Height)), *i));
+    let (mut dumped, mut not_read, mut not_2d, mut small) = (0, 0, 0, 0);
+    let mut late = Vec::new();
+    // The target that took longest (ms, its number in the file names).
+    let mut slowest = (0, None);
+    for (i, d) in order {
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            not_2d += 1;
+            continue;
+        }
+        if d.Width < DUMP_SMALLEST || u64::from(d.Height) < DUMP_SMALLEST {
+            small += 1;
+            continue;
+        }
+        let (resource, copy) = &targets[i];
+        if started.elapsed() >= DUMP_BUDGET {
+            late.push(format!("{i:02} {resource:#x} {}x{} f{}", d.Width, d.Height, d.Format.0));
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        let resource = *resource as crate::object::This;
+        let one = std::time::Instant::now();
+        if dump_one(host, &copy.texture, state, frame, i, resource, &d) {
+            dumped += 1;
+        } else {
+            not_read += 1;
+        }
+        let ms = one.elapsed().as_millis();
+        if ms >= slowest.0 {
+            slowest = (ms, Some(i));
+        }
+    }
+    tracing::info!(
+        frame,
+        dumped,
+        ms = started.elapsed().as_millis(),
+        slowest_ms = slowest.0,
+        slowest = ?slowest.1,
+        not_read,
+        not_2d,
+        smaller_than_32 = small,
+        past_the_budget = late.len(),
+        "targets dumped"
+    );
+    if !late.is_empty() {
+        tracing::warn!(
+            frame,
+            budget_s = DUMP_BUDGET.as_secs(),
+            skipped = ?late,
+            "targets not dumped: the frame's dump time ran out"
+        );
     }
 }
 
+/// Saves one target; false if nothing was saved (no list, no read-back, a
+/// format not handled).
 fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
@@ -252,8 +368,8 @@ fn dump_one(
     i: usize,
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
-) {
-    let Ok(list) = host.new_list() else { return };
+) -> bool {
+    let Ok(list) = host.new_list() else { return false };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -271,26 +387,28 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint)) = read else { return false };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return;
+            return false;
         }
         let pitch = f.RowPitch as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
+        if let Some(rgba) = &rgba {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
         buffer.Unmap(0, None);
+        rgba.is_some()
     }
 }
 
@@ -315,15 +433,44 @@ fn small_float(bits: u32, man: u32) -> f32 {
     }
 }
 
-/// Rows of a host format as 8-bit RGBA: 8-bit color as is, everything else
-/// as channel values scaled so the largest finite one is white (single
-/// channels: lowest black, highest white, as grey). `None` for formats not
-/// handled.
+/// Rows of a host format as 8-bit RGBA: 8-bit color as is, wide integer
+/// formats a colour per value ([`id_colour`]), everything else as channel
+/// values scaled so the largest finite one is white (single channels:
+/// lowest black, highest white, as grey). `None` for formats not handled.
 fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
     let u32_at = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap_or([0; 4]));
+    // Integers, four or two channels of 32 or 16 bits (ids: a visibility
+    // buffer's triangle and instance, say): a colour per value, zero black.
+    // Scaled by the largest, all but the largest ids would look black.
+    let integers = match format {
+        3 | 4 => Some((4, 4)),
+        12 | 14 => Some((4, 2)),
+        17 | 18 => Some((2, 4)),
+        _ => None,
+    };
+    if let Some((channels, bytes)) = integers {
+        let (mut low, mut high, mut nonzero) = (u32::MAX, 0, 0u64);
+        for y in 0..h {
+            for x in 0..w {
+                let p = px(x, y, channels * bytes);
+                let v: [u32; 4] = std::array::from_fn(|c| match (c < channels, bytes) {
+                    (false, _) => 0,
+                    (true, 4) => u32_at(p, c),
+                    (true, _) => u32::from(u16_at(p, c)),
+                });
+                for &c in &v[..channels] {
+                    (low, high) = (low.min(c), high.max(c));
+                }
+                nonzero += u64::from(v != [0; 4]);
+                out.extend(id_colour(v));
+            }
+        }
+        tracing::info!(format, low, high, nonzero, shown = "a colour per value", "target values");
+        return Some(out);
+    }
     // Channel values as floats, then scaled.
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
@@ -354,6 +501,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
         })),
         9..=11 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
+        // R16G16B16A16_SNORM.
+        13 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i) as i16) / 32767.0))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
@@ -388,6 +537,23 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
+}
+
+/// The colour an integer pixel (ids) is shown in: black for zero, else a
+/// bright one from a hash of the value, so neighbouring ids differ.
+fn id_colour(v: [u32; 4]) -> [u8; 4] {
+    if v == [0; 4] {
+        return [0, 0, 0, 255];
+    }
+    let mut h = 0x811c_9dc5u32;
+    for c in v {
+        h = (h ^ c).wrapping_mul(0x0100_0193);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+    }
+    let [r, g, b, _] = h.to_le_bytes();
+    [r | 0x40, g | 0x40, b | 0x40, 255]
 }
 
 /// Pixels per side of the grid [`probe`] reads.
@@ -521,5 +687,39 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    /// Two-channel 32-bit integer targets (a visibility buffer's ids):
+    /// cleared pixels black, each id a colour of its own.
+    #[test]
+    fn integer_targets_get_a_colour_per_value() {
+        const R32G32_UINT: u32 = 17;
+        let pixels: [[u32; 2]; 4] = [[0, 0], [5, 7], [5, 7], [5, 8]];
+        let rows: Vec<u8> = pixels.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        let rgba = super::to_rgba(R32G32_UINT, 4, 1, rows.len(), &rows).unwrap();
+        let p: Vec<&[u8]> = rgba.chunks(4).collect();
+        assert_eq!(p[0], [0, 0, 0, 255]);
+        assert_ne!(p[1], p[0]);
+        assert_eq!(p[1], p[2]);
+        assert_ne!(p[1], p[3]);
+        // Sixteen-bit, four channels: the same.
+        const R16G16B16A16_UINT: u32 = 12;
+        let rows: Vec<u8> = [[0u16; 4], [1, 2, 3, 4]].iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        let rgba = super::to_rgba(R16G16B16A16_UINT, 2, 1, rows.len(), &rows).unwrap();
+        assert_eq!(rgba[..4], [0, 0, 0, 255]);
+        assert_ne!(rgba[4..], [0, 0, 0, 255]);
+    }
+
+    /// `VICTORY_CAPTURE_AFTER` offsets count from the first world frame,
+    /// once there is one.
+    #[test]
+    fn frames_count_from_the_first_world_frame() {
+        let offsets = [0, 3, 10];
+        assert!(!super::after_world(3, 0, &offsets));
+        assert!(super::after_world(100, 100, &offsets));
+        assert!(super::after_world(103, 100, &offsets));
+        assert!(super::after_world(110, 100, &offsets));
+        assert!(!super::after_world(104, 100, &offsets));
+        assert!(!super::after_world(97, 100, &offsets));
     }
 }

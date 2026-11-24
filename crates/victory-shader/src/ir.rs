@@ -14,6 +14,16 @@
 //! M0-relative VGPR access (`v_movrels/d/sd_b32`, `v_swaprel_b32`) names its
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
+//!
+//! Spilled SGPRs are forwarded. The console compiler keeps SGPRs it has no
+//! register for in the lanes of a VGPR it reserves: `v_writelane_b32` of an
+//! SGPR to a constant lane stores one, `v_readlane_b32` of that lane gets
+//! it back (neither looks at EXEC). Where a VGPR is used by nothing but
+//! such stores and reloads, each of its lanes is a scalar variable of its
+//! own ([`Reg::Spill`]): a reload's result is the value stored, joined by a
+//! phi where stores differ, and the stores and reloads themselves are
+//! dropped. What was spilled (a lane mask, an address, a descriptor word)
+//! is then the same [`Value`] before and after.
 
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
@@ -25,6 +35,10 @@ pub enum Reg {
     S(u8),
     Scc,
     V(u8),
+    /// Lane `1` of VGPR `0`, which the program only keeps spilled SGPRs in
+    /// (see the module documentation). No instruction of a [`Program`]
+    /// names one: it is the register of a phi joining what was stored.
+    Spill(u8, u8),
 }
 
 pub const VCC: u8 = 106;
@@ -119,11 +133,168 @@ impl Inst {
     }
 }
 
+/// The first user SGPR that the spill table of root arguments stands for.
+const SPILL_FIRST: u8 = 16;
+
+/// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
+/// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
+/// the user SGPRs the table's dwords stand for. Only loads with a constant
+/// offset, in code no branch joins after the pointer is set up, are rewritten.
+fn spill_loads(
+    list: Vec<Instruction>,
+    wave64: bool,
+    code_len: usize,
+) -> Result<Vec<Instruction>, ShaderError> {
+    use gfx10::Fields::{Smem, Sop, Valu};
+    let mut targets = std::collections::BTreeSet::new();
+    for inst in list.iter() {
+        let flow = gfx10::control(inst, code_len, |at| {
+            list[..list.partition_point(|i| i.offset < at)].last()
+        })?;
+        if let Flow::Jump(t) | Flow::Branch(t) = flow {
+            targets.insert(t);
+        }
+    }
+    // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
+    let mut tag = [0u8; 128];
+    tag[0] = 1;
+    tag[1] = 2;
+    let mut out = Vec::with_capacity(list.len());
+    let scalar = |o: &Operand| match *o {
+        Operand::Scalar { code, dwords } if code < 106 => Some((code, dwords.max(1))),
+        _ => None,
+    };
+    for inst in list {
+        if targets.contains(&inst.offset) {
+            tag = [0; 128];
+        }
+        let f = inst.fields(wave64);
+        let name = inst.name().unwrap_or("");
+        // The load of the table.
+        if let Smem {
+            data: Some(ref d),
+            ref base,
+            offset,
+            ref soffset,
+            ..
+        } = f
+            && name.starts_with("s_load_dword")
+            && let Some((a, 2)) = scalar(base)
+            && tag[a as usize] == 1
+            && tag[a as usize + 1] == 2
+            && offset >= 0
+            && offset % 4 == 0
+            && matches!(*soffset, Operand::Scalar { code: 125, .. })
+            && let Some((dst, n)) = scalar(d)
+        {
+            let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
+            if first + u32::from(n) <= 105 {
+                for k in 0..n {
+                    let mov =
+                        0xBE80_0000 | u32::from(dst + k) << 16 | 3 << 8 | (first + u32::from(k));
+                    let mut bytes = mov.to_le_bytes().to_vec();
+                    bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
+                    let mut one = gfx10::decode(&bytes)?.remove(0);
+                    one.offset = inst.offset;
+                    out.push(one);
+                }
+                for k in 0..n {
+                    tag[(dst + k) as usize] = 0;
+                }
+                continue;
+            }
+        }
+        // What this instruction does to the tracked registers.
+        let mut written: Vec<(u8, u8)> = Vec::new();
+        match &f {
+            Sop {
+                dst: Some(d), src, ..
+            } => {
+                if let Some((dc, dn)) = scalar(d) {
+                    let new = match (name, src.as_slice()) {
+                        ("s_mov_b32", [x]) => match scalar(x) {
+                            Some((c, _)) if tag[c as usize] != 0 => tag[c as usize],
+                            _ => 0,
+                        },
+                        ("s_and_b32", [x, y]) => {
+                            // `s1 & mask` with a small mask, either way round.
+                            let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
+                                (Some((c, _)), Operand::Literal(m)) => {
+                                    tag[c as usize] == 2 && *m <= 0xFFFF
+                                }
+                                (Some((c, _)), Operand::Const(k)) => {
+                                    tag[c as usize] == 2 && (129..=192).contains(k)
+                                }
+                                _ => false,
+                            };
+                            if masked(x, y) || masked(y, x) { 2 } else { 0 }
+                        }
+                        _ => 0,
+                    };
+                    if dn == 1 {
+                        tag[dc as usize] = new;
+                    } else {
+                        written.push((dc, dn));
+                    }
+                }
+            }
+            Smem { data: Some(d), .. } => written.extend(scalar(d)),
+            Valu(v) => {
+                written.extend(v.dst.as_ref().and_then(scalar));
+                written.extend(v.carry.as_ref().and_then(scalar));
+            }
+            _ => {}
+        }
+        for (c, n) in written {
+            for k in c..c.saturating_add(n).min(128) {
+                tag[k as usize] = 0;
+            }
+        }
+        out.push(inst);
+    }
+    Ok(out)
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
-    let list = gfx10::decode(code)?;
+    build_with(code, wave64, vgprs, false)
+}
+
+/// [`build`]; with `spilled`, loads from the root-argument spill table that
+/// `s[0:1]` points to read the user SGPRs the table stands for (table dword
+/// `k` is user SGPR `16 + k`), as plain register copies.
+pub fn build_with(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    spilled: bool,
+) -> Result<Program, ShaderError> {
+    // VGPRs found not to be spill registers after all.
+    let mut kept = Vec::new();
+    loop {
+        match build_forwarding(code, wave64, vgprs, spilled, &kept)? {
+            Ok(program) => return Ok(program),
+            Err(vgpr) => kept.push(vgpr),
+        }
+    }
+}
+
+/// [`build_with`] with every spill register outside `kept` forwarded. Stops
+/// with a VGPR among them of which some lane is reloaded on a path that
+/// never stored it: no spill then, whatever it is.
+fn build_forwarding(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    spilled: bool,
+    kept: &[u8],
+) -> Result<Result<Program, u8>, ShaderError> {
+    let mut list = gfx10::decode(code)?;
+    if spilled {
+        list = spill_loads(list, wave64, code.len())?;
+    }
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -203,6 +374,21 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         });
     }
     split_irreducible(&mut blocks)?;
+    let spills = spill_registers(&blocks, wave64, kept);
+    for inst in blocks.iter_mut().flat_map(|b| &mut b.insts) {
+        if let Some(access) = spill_access(inst, wave64)
+            && let Some(slot) = spills.iter().position(|&r| r == access.vgpr)
+        {
+            // While building, the register is named by its slot (`index`).
+            let cell = (Reg::Spill(slot as u8, access.lane), NONE);
+            let sgpr = (Reg::S(access.sgpr), NONE);
+            (inst.reads, inst.writes) = if access.store {
+                (vec![sgpr], vec![cell])
+            } else {
+                (vec![cell], vec![sgpr])
+            };
+        }
+    }
 
     let order = reverse_postorder(&blocks);
     let (live_in, live_out) = liveness(&blocks, &order);
@@ -261,19 +447,121 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             debug_assert!(!phi.args.contains(&NONE), "{phi:?}");
         }
     }
-    remove_trivial_phis(&mut blocks, values);
-    Ok(Program {
+    if let Some(&(Reg::Spill(slot, _), _)) = inputs.iter().find(|i| matches!(i.0, Reg::Spill(..))) {
+        return Ok(Err(spills[usize::from(slot)]));
+    }
+    // A store or reload is a copy: its result is replaced by its source.
+    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+    for block in &mut blocks {
+        block.insts.retain(|inst| {
+            let cell = |r: &(Reg, Value)| matches!(r.0, Reg::Spill(..));
+            if inst.reads.iter().chain(&inst.writes).any(cell) {
+                replaced[inst.writes[0].1.0 as usize] = inst.reads[0].1;
+                false
+            } else {
+                true
+            }
+        });
+        for phi in &mut block.phis {
+            if let Reg::Spill(slot, lane) = phi.reg {
+                phi.reg = Reg::Spill(spills[usize::from(slot)], lane);
+            }
+        }
+    }
+    remove_trivial_phis(&mut blocks, replaced);
+    Ok(Ok(Program {
         wave64,
         vgprs,
         blocks,
         inputs,
-    })
+    }))
+}
+
+/// VGPRs forwarded as spill registers at most; a program has one or two.
+const MAX_SPILL_VGPRS: usize = 4;
+
+/// A spill store (`v_writelane_b32 vgpr, sgpr, lane`) or reload
+/// (`v_readlane_b32 sgpr, vgpr, lane`).
+struct SpillAccess {
+    store: bool,
+    vgpr: u8,
+    lane: u8,
+    sgpr: u8,
+}
+
+/// `inst` as a store of one SGPR dword to a constant lane of a VGPR, or the
+/// reload of one. Both ignore EXEC and touch that lane only.
+fn spill_access(inst: &Inst, wave64: bool) -> Option<SpillAccess> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    let plain = v.sdwa.is_none()
+        && v.dpp.is_none()
+        && v.carry.is_none()
+        && (v.abs, v.neg, v.neg_hi, v.opsel, v.opsel_hi, v.omod) == (0, 0, 0, 0, 0, 0)
+        && !v.clamp;
+    let sgpr = |op: &Operand| match *op {
+        // Any scalar register dword (a half of VCC or EXEC too), but no
+        // constant: the null register reads as zero.
+        Operand::Scalar { code, dwords: 1 } if code != gfx10::NULL => Some(code),
+        _ => None,
+    };
+    let lane = |op: &Operand| {
+        let lane = match *op {
+            Operand::Const(c @ 128..=192) => u32::from(c) - 128,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        // The hardware takes the lane modulo the wave size; the compiler
+        // names none outside it, and nothing here relies on the wrap.
+        (lane < if wave64 { 64 } else { 32 }).then_some(lane as u8)
+    };
+    match (inst.name(), v.dst, &v.src[..]) {
+        ("v_writelane_b32", Some(Operand::Vector { reg, dwords: 1 }), [value, at]) if plain => {
+            Some(SpillAccess {
+                store: true,
+                vgpr: reg,
+                lane: lane(at)?,
+                sgpr: sgpr(value)?,
+            })
+        }
+        ("v_readlane_b32", Some(dst), [Operand::Vector { reg, dwords: 1 }, at]) if plain => {
+            Some(SpillAccess {
+                store: false,
+                vgpr: *reg,
+                lane: lane(at)?,
+                sgpr: sgpr(&dst)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The VGPRs nothing reads or writes but spill stores and reloads (before
+/// renaming: by the registers `effects` names), except those in `kept`.
+fn spill_registers(blocks: &[Block], wave64: bool, kept: &[u8]) -> Vec<u8> {
+    let (mut stored, mut other) = ([false; 256], [false; 256]);
+    for inst in blocks.iter().flat_map(|b| &b.insts) {
+        let access = spill_access(inst, wave64);
+        for &(reg, _) in inst.reads.iter().chain(&inst.writes) {
+            if let Reg::V(r) = reg {
+                match &access {
+                    Some(a) if a.vgpr == r => stored[usize::from(r)] |= a.store,
+                    _ => other[usize::from(r)] = true,
+                }
+            }
+        }
+    }
+    (0..=255u8)
+        .filter(|&r| stored[usize::from(r)] && !other[usize::from(r)] && !kept.contains(&r))
+        .take(MAX_SPILL_VGPRS)
+        .collect()
 }
 
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
-/// SGPR codes 0-127, SCC, VGPRs 0-255.
-const REGS: usize = 128 + 1 + 256;
+/// SGPR codes 0-127, SCC, VGPRs 0-255, the lanes of the spill registers.
+const REGS: usize = 128 + 1 + 256 + 64 * MAX_SPILL_VGPRS;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
@@ -281,6 +569,8 @@ fn index(reg: Reg) -> usize {
         Reg::S(c) => usize::from(c),
         Reg::Scc => 128,
         Reg::V(r) => 129 + usize::from(r),
+        // While building: by the VGPR's place among the spill registers.
+        Reg::Spill(slot, lane) => 385 + 64 * usize::from(slot) + usize::from(lane),
     }
 }
 
@@ -288,7 +578,8 @@ fn reg_at(i: usize) -> Reg {
     match i {
         0..128 => Reg::S(i as u8),
         128 => Reg::Scc,
-        _ => Reg::V((i - 129) as u8),
+        129..385 => Reg::V((i - 129) as u8),
+        _ => Reg::Spill(((i - 385) / 64) as u8, ((i - 385) % 64) as u8),
     }
 }
 
@@ -591,8 +882,9 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
-fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    let mut replaced: Vec<Value> = (0..values).map(Value).collect();
+/// `replaced` names the value each value was already replaced by (itself
+/// for the others).
+fn remove_trivial_phis(blocks: &mut [Block], mut replaced: Vec<Value>) {
     let find = |replaced: &[Value], mut v: Value| {
         while replaced[v.0 as usize] != v {
             v = replaced[v.0 as usize];
@@ -1043,6 +1335,73 @@ mod tests {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
     }
 
+    /// A compute program whose root arguments are in the spill table `s[0:1]`
+    /// points to: the loads become copies of the user SGPRs the dwords stand for.
+    #[test]
+    fn spill_table_loads_read_user_sgprs() {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0x8703_FF01,    // s_and_b32 s3, s1, lit
+            0x0000_00FF,    //   0xff
+            0xF408_0201,    // s_load_dwordx4 s[8:11], s[2:3], 0x10
+            0xFA00_0010,
+            0xBE86_0308, // s_mov_b32 s6, s8
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let plain = build_with(&code, false, 256, false).unwrap();
+        assert!(
+            plain
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "s_load_dwordx4")
+        );
+        let p = build_with(&code, false, 256, true).unwrap();
+        let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
+        // Table dwords 4..8 are user SGPRs 20..24.
+        for k in 0..4 {
+            assert!(
+                p.inputs.iter().any(|i| i.0 == Reg::S(20 + k)),
+                "s{} read",
+                20 + k
+            );
+        }
+        assert_eq!(
+            insts.iter().filter(|i| i.name() == "s_mov_b32").count(),
+            1 + 4 + 1
+        );
+    }
+
+    /// Loads from a pointer that is not the spill table stay loads.
+    #[test]
+    fn spill_table_leaves_other_loads() {
+        let code: Vec<u8> = [
+            0xF408_0A00u32, // s_load_dwordx4 s[8:11], s[0:1], 0 (s0:1 not yet copied: tagged)
+            0xFA00_0000,
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xF408_0201, // s_load_dwordx4 s[8:11], s[2:3], 0 (s2 overwritten)
+            0xFA00_0000,
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build_with(&code, false, 256, true).unwrap();
+        let loads = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name().starts_with("s_load"))
+            .count();
+        // The first load is from s[0:1] itself, so it is rewritten; the second
+        // reads a pointer the program overwrote, so it stays.
+        assert_eq!(loads, 1);
+    }
+
     #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [
@@ -1191,6 +1550,123 @@ mod tests {
                 what: "s_movrels_b32"
             })
         );
+    }
+
+    const WRITELANE_V0_S9_3: [u32; 2] = [0xD761_0000, 0x0001_0609];
+    const READLANE_S2_V0_3: [u32; 2] = [0xD760_0002, 0x0001_0700];
+    const V_MOV_V1_S2: u32 = 0x7E02_0202;
+
+    fn names(p: &Program) -> Vec<&'static str> {
+        p.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().map(Inst::name))
+            .collect()
+    }
+
+    #[test]
+    fn spilled_sgprs_are_forwarded() {
+        for wave64 in [false, true] {
+            let p = build_words(
+                &[
+                    WRITELANE_V0_S9_3[0],
+                    WRITELANE_V0_S9_3[1],
+                    0xBE89_0380, // s_mov_b32 s9, 0
+                    READLANE_S2_V0_3[0],
+                    READLANE_S2_V0_3[1],
+                    V_MOV_V1_S2,
+                    S_ENDPGM,
+                ],
+                wave64,
+            );
+            // The store and the reload are gone; the reload's reader sees
+            // what s9 held at the store.
+            assert_eq!(names(&p), ["s_mov_b32", "v_mov_b32", "s_endpgm"]);
+            let mov = &p.blocks[0].insts[1];
+            assert_eq!(mov.read(Reg::S(2)), Some(input(&p, Reg::S(9))));
+            assert!(p.inputs.iter().all(|i| i.0 != Reg::V(0)), "{:?}", p.inputs);
+        }
+    }
+
+    #[test]
+    fn spills_that_differ_join_in_a_phi() {
+        let p = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0003, // s_cbranch_scc1 -> 20
+                WRITELANE_V0_S9_3[0],
+                WRITELANE_V0_S9_3[1],
+                0xBF82_0002, // s_branch -> 28
+                0xD761_0000,
+                0x0001_0608, // 20: v_writelane_b32 v0, s8, 3
+                READLANE_S2_V0_3[0],
+                READLANE_S2_V0_3[1], // 28
+                V_MOV_V1_S2,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        assert_eq!(
+            names(&p),
+            [
+                "s_cmp_eq_u32",
+                "s_cbranch_scc1",
+                "s_branch",
+                "v_mov_b32",
+                "s_endpgm"
+            ]
+        );
+        let join = p.blocks.iter().find(|b| b.preds.len() == 2).unwrap();
+        let [phi] = &join.phis[..] else {
+            panic!("{:?}", join.phis)
+        };
+        assert_eq!(phi.reg, Reg::Spill(0, 3));
+        let mut args = phi.args.clone();
+        args.sort();
+        let mut stored = [input(&p, Reg::S(8)), input(&p, Reg::S(9))];
+        stored.sort();
+        assert_eq!(args, stored);
+        assert_eq!(join.insts[0].read(Reg::S(2)), Some(phi.value));
+    }
+
+    #[test]
+    fn lanes_that_are_no_spill_slots_stay() {
+        // Reloaded on a path that never stored: whatever v0 held on entry.
+        let unset = build_words(
+            &[
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF85_0002, // s_cbranch_scc1 -> 16
+                WRITELANE_V0_S9_3[0],
+                WRITELANE_V0_S9_3[1],
+                READLANE_S2_V0_3[0],
+                READLANE_S2_V0_3[1], // 16
+                V_MOV_V1_S2,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        // Read as a vector too.
+        let vector = build_words(
+            &[
+                WRITELANE_V0_S9_3[0],
+                WRITELANE_V0_S9_3[1],
+                0x7E06_0300, // v_mov_b32 v3, v0
+                READLANE_S2_V0_3[0],
+                READLANE_S2_V0_3[1],
+                V_MOV_V1_S2,
+                S_ENDPGM,
+            ],
+            false,
+        );
+        for p in [unset, vector] {
+            let names = names(&p);
+            assert!(names.contains(&"v_writelane_b32"), "{names:?}");
+            assert!(names.contains(&"v_readlane_b32"), "{names:?}");
+            let all = p.blocks.iter().flat_map(|b| &b.phis);
+            assert!(
+                all.into_iter()
+                    .all(|phi| !matches!(phi.reg, Reg::Spill(..)))
+            );
+        }
     }
 
     #[test]

@@ -2,13 +2,17 @@
 //! title's graphics state with the translated shaders, under a root
 //! signature of our own that the translated shaders' bindings define
 //! (`victory_shader::emit`): per stage one block of root constants for the
-//! user data, root views for the title's root views, static samplers for
-//! the immediate samplers, and directly indexed heaps.
+//! user data, root views for the title's root constant buffers and tables
+//! of one view for its root shader views (bounded:
+//! [`crate::draw::BOUNDED_ROOT_SRVS`]), static samplers for the immediate
+//! samplers, and directly indexed heaps. A pipeline's rectangle-list draws
+//! get a second host pipeline, the same plus a geometry shader of ours
+//! ([`HostPipeline::rects`], [`crate::rects`]).
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -179,7 +183,12 @@ impl GraphicsState {
             .map(|(e, name)| {
                 format!(
                     "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
                 )
             })
             .collect();
@@ -244,6 +253,7 @@ const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
 /// One stage of a host pipeline and where its bindings go.
+#[derive(Clone)]
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
@@ -251,6 +261,8 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
+    pub(crate) stride_table: Option<u32>,
 }
 
 impl Stage {
@@ -275,6 +287,9 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Its name in the pipeline library (what its description holds), which
+    /// its rectangle pipeline's name is made from ([`HostPipeline::rects`]).
+    library: String,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -321,7 +336,10 @@ impl HostPipeline {
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
-            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+            return refuse(
+                "the host GPU has no mesh shaders (or no shader model 6.6)",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -330,6 +348,9 @@ impl HostPipeline {
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
+        // The ranges of root shader views' tables, by parameter: pointed
+        // at once all are made (the vector no longer moves).
+        let mut ranges: Vec<(usize, D3D12_DESCRIPTOR_RANGE1)> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
@@ -339,6 +360,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_table: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -369,6 +391,11 @@ impl HostPipeline {
             ] {
                 for &slot in slots {
                     out.push((slot, params.len() as u32));
+                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && crate::draw::BOUNDED_ROOT_SRVS {
+                        ranges.push((params.len(), root_srv_range(slot)));
+                        params.push(root_srv_table(std::ptr::null(), visibility));
+                        continue;
+                    }
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,
                         Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -381,6 +408,20 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            if t.stride_table {
+                stage.stride_table = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: STRIDE_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
@@ -401,13 +442,17 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        for (param, range) in &ranges {
+            params[*param] = root_srv_table(range, params[*param].ShaderVisibility);
+        }
+        let (root, root_blob) =
+            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    return None;
+                }
+            };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -451,6 +496,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                library: name,
             });
         }
         let Some(g) = g else {
@@ -483,35 +529,12 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                library: name,
             });
         }
 
-        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-            // SAFETY: a borrowed pointer the description never releases.
-            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
-            PS: code(1),
-            BlendState: g.blend,
-            SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
-            DepthStencilState: g.depth,
-            InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                pInputElementDescs: g.inputs.as_ptr(),
-                NumElements: g.inputs.len() as u32,
-            },
-            IBStripCutValue: g.strip_cut,
-            // The console's rectangle and quad types draw as triangles on
-            // the host (see `draw`).
-            PrimitiveTopologyType: match g.topology.0 {
-                RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                _ => g.topology,
-            },
-            NumRenderTargets: g.targets.NumRenderTargets,
-            RTVFormats: g.targets.RTFormats,
-            DSVFormat: g.depth_format,
-            SampleDesc: g.samples,
-            ..Default::default()
-        };
+        let none = D3D12_SHADER_BYTECODE::default();
+        let desc = graphics_desc(&root, [code(0), none, code(1)], g);
         let name = super::library::name(
             "graphics",
             &root_blob,
@@ -553,7 +576,123 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            library: name,
         })
+    }
+
+    /// The pipeline for this one's rectangle-list draws ([`crate::rects`]):
+    /// the same root signature, shaders and state `g` (the title's, culling
+    /// no faces unless [`crate::rects::CULLED`]) plus the geometry shader
+    /// that completes each rectangle, drawing triangles. Why not, as a drop reason, if it cannot be made. Made by a
+    /// pipeline worker on the first rectangle draw (`make::ready_rects`), so
+    /// the non-rectangle pipeline is untouched; kept in the library under a
+    /// name of its own, made from this one's and the geometry shader's
+    /// bytes.
+    pub(crate) fn rects(&self, g: Option<&GraphicsState>) -> Result<HostPipeline, &'static str> {
+        if self.compute || self.mesh {
+            return Err("rectangles: not a vertex pipeline");
+        }
+        let g = g.ok_or("rectangles: graphics state not kept")?;
+        // Triangles in, for the geometry shader.
+        if g.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && g.topology.0 != RECTANGLES {
+            return Err("rectangles: not a triangle or rectangle pipeline");
+        }
+        let code = |b: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: b.as_ptr().cast(),
+            BytecodeLength: b.len(),
+        };
+        let vs = &self.stages[0].translated().host.dxil;
+        let ps = self
+            .stages
+            .get(1)
+            .map(|s| s.translated().host.dxil.as_slice());
+        let gs = crate::rects::geometry_shader(vs, ps)?;
+        let host = host().ok_or("rectangles: no host device")?;
+        let ps = ps.map_or_else(D3D12_SHADER_BYTECODE::default, code);
+        let mut desc = graphics_desc(&self.root, [code(vs), code(&gs), ps], g);
+        // Both faces unless asked otherwise (`rects::CULLED`); the library
+        // name says which, as the description differs.
+        let culled = crate::rects::CULLED;
+        if !culled {
+            desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        }
+        let faces = if culled { "" } else { "cull none" };
+        let library = super::library::name("rectangles", self.library.as_bytes(), &[&gs], faces);
+        let made = super::library::pipeline(
+            &library,
+            // SAFETY: the description points at live data.
+            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+            // SAFETY: as above.
+            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+        );
+        let pso = match made {
+            Ok(pso) => pso,
+            Err(e) => {
+                tracing::warn!(error = %e, pipeline = self.name, "host rectangle pipeline refused");
+                host.log_messages();
+                return Err("rectangles: host pipeline refused");
+            }
+        };
+        let name = format!("{} with rectangles", self.name);
+        // The title's face culling (1 none, 2 front, 3 back), whatever the
+        // host does with it: what settles whether the console culls
+        // rectangle lists, if a pass stays black.
+        tracing::info!(
+            pipeline = self.name,
+            cull = g.rasterizer.CullMode.0,
+            front_ccw = g.rasterizer.FrontCounterClockwise.as_bool(),
+            culled,
+            "host rectangle pipeline"
+        );
+        crate::host::name(&pso, || name.clone());
+        Ok(HostPipeline {
+            compute: false,
+            mesh: false,
+            pso,
+            root: self.root.clone(),
+            stages: self.stages.clone(),
+            slots: self.slots,
+            inputs: self.inputs.clone(),
+            name,
+            library,
+        })
+    }
+}
+
+/// The host description of a graphics pipeline: `root` (borrowed), the
+/// vertex, geometry and pixel stages, and the title's state `g`, which it
+/// points into.
+fn graphics_desc(
+    root: &ID3D12RootSignature,
+    [vs, gs, ps]: [D3D12_SHADER_BYTECODE; 3],
+    g: &GraphicsState,
+) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        // SAFETY: a borrowed pointer the description never releases.
+        pRootSignature: unsafe { std::mem::transmute_copy(root) },
+        VS: vs,
+        GS: gs,
+        PS: ps,
+        BlendState: g.blend,
+        SampleMask: g.sample_mask,
+        RasterizerState: g.rasterizer,
+        DepthStencilState: g.depth,
+        InputLayout: D3D12_INPUT_LAYOUT_DESC {
+            pInputElementDescs: g.inputs.as_ptr(),
+            NumElements: g.inputs.len() as u32,
+        },
+        IBStripCutValue: g.strip_cut,
+        // The console's rectangle and quad types draw as triangles on the
+        // host (see `draw`).
+        PrimitiveTopologyType: match g.topology.0 {
+            RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            _ => g.topology,
+        },
+        NumRenderTargets: g.targets.NumRenderTargets,
+        RTVFormats: g.targets.RTFormats,
+        DSVFormat: g.depth_format,
+        SampleDesc: g.samples,
+        ..Default::default()
     }
 }
 
@@ -585,15 +724,27 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
     let mut stream = Stream {
-        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+        root: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
+            root.as_raw(),
+        ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
+        mask: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
+            g.sample_mask,
+        ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
+        targets: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            g.targets,
+        ),
+        dsv: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+            g.depth_format,
+        ),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
@@ -610,13 +761,51 @@ fn mesh_pipeline(
     )
 }
 
+/// The range of a root shader view's table ([`root_srv_table`]): one raw
+/// view at the register the translated shader binds (`t<slot>` in
+/// [`ROOT_CBV_SPACE`]). Volatile descriptors and data: with static ones
+/// (root signature 1.1's default for tables) the driver may make the view
+/// a root descriptor, which nothing bounds.
+pub(crate) fn root_srv_range(slot: u8) -> D3D12_DESCRIPTOR_RANGE1 {
+    D3D12_DESCRIPTOR_RANGE1 {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 1,
+        BaseShaderRegister: u32::from(slot),
+        RegisterSpace: ROOT_CBV_SPACE,
+        Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+            | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+        OffsetInDescriptorsFromTableStart: 0,
+    }
+}
+
+/// The root parameter of a root shader view, bounded
+/// ([`crate::draw::BOUNDED_ROOT_SRVS`]): a table of `range` (live until the
+/// root signature is serialized), set per draw to a raw view of the
+/// buffer's host copy (`draw::State::root_srv_table`).
+pub(crate) fn root_srv_table(
+    range: *const D3D12_DESCRIPTOR_RANGE1,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER1 {
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: range,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
 /// The bytes of shader code (none for an absent stage).
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
+        .to_vec()
 }
 
 fn root_signature(
@@ -663,5 +852,72 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_shader::emit::HostShader;
+
+    /// Rectangle pipelines as [`HostPipeline::rects`] describes them, for
+    /// hand-written output signatures: a vertex shader as translations emit
+    /// it (the shader crate's stub, its outputs the pixel shader's inputs,
+    /// registers and all), the geometry shader made for it and a DXIL pixel
+    /// shader. The position alone (as the title's tiled-lighting programs
+    /// have it); with float interpolants sharing rows and a flat integer;
+    /// with interpolation modifiers, a flat float and clip distances. The
+    /// host takes each.
+    #[test]
+    fn rectangle_pipelines_take_the_geometry_shader() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        const INPUTS: [&str; 3] = [
+            "float4 pos : SV_Position",
+            "float4 pos : SV_Position, float2 a : TEXCOORD0, float2 b : TEXCOORD1, \
+             nointerpolation uint c : TEXCOORD2",
+            "float4 pos : SV_Position, noperspective float2 a : A, nointerpolation float b : B, \
+             centroid float4 c : C, float2 clip : SV_ClipDistance0",
+        ];
+        let code = |b: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: b.as_ptr().cast(),
+            BytecodeLength: b.len(),
+        };
+        for inputs in INPUTS {
+            let source = format!("float4 main({inputs}) : SV_Target {{ return pos; }}");
+            let Ok(ps) = crate::rects::compile(&source, "ps_6_0") else {
+                eprintln!("no dxcompiler.dll: not run");
+                return;
+            };
+            let ps = HostShader {
+                stage: victory_shader::HwStage::Ps,
+                dxil: ps,
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                stride_table: false,
+            };
+            let vs = victory_shader::emit::host::stub_vs(&ps).unwrap();
+            let outputs = crate::rects::elements(&vs.dxil, victory_shader::FourCC::OSG1).unwrap();
+            assert_eq!(outputs.len(), inputs.split(',').count(), "{inputs}");
+            let gs = crate::rects::geometry_shader(&vs.dxil, Some(&ps.dxil))
+                .unwrap_or_else(|e| panic!("{inputs}: {e}"));
+            let (root, _) = root_signature(&host.device, &[], &[], false).unwrap();
+            let mut g = GraphicsState {
+                topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE(RECTANGLES),
+                ..Default::default()
+            };
+            g.targets.NumRenderTargets = 1;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            g.depth.DepthEnable = false.into();
+            let desc = graphics_desc(&root, [code(&vs.dxil), code(&gs), code(&ps.dxil)], &g);
+            assert_eq!(desc.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            // SAFETY: the description points at live data.
+            let made = unsafe { host.device.CreateGraphicsPipelineState::<ID3D12PipelineState>(&desc) };
+            assert!(made.is_ok(), "{inputs}: {made:?} {:?}", host.log_messages());
+        }
     }
 }

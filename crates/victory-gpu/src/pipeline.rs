@@ -201,6 +201,18 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The host pipeline for rectangle-list draws of a title pipeline whose
+/// host pipeline is made ([`host::HostPipeline::rects`]): queued by the
+/// first use and made by a worker, as host pipelines are. While it is being
+/// made, or if it cannot be, why not (a drop reason).
+#[cfg(windows)]
+pub(crate) fn rect_pipeline<'a>(this: This) -> Result<&'a host::HostPipeline, &'static str> {
+    if this.is_null() {
+        return Err("rectangles: no pipeline set");
+    }
+    make::ready_rects(&pipeline(this).host)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

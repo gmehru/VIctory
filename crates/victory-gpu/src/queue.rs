@@ -52,7 +52,12 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "command queue");
+    static QUEUES: AtomicU64 = AtomicU64::new(0);
+    tracing::info!(
+        ?desc,
+        queues = QUEUES.fetch_add(1, Ordering::Relaxed) + 1,
+        "command queue"
+    );
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -111,9 +116,25 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
+    }
+    // Which queues submit, and how often (the first submissions of each kind
+    // and then at powers of two).
+    static BY_KIND: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+    if !this.is_null() {
+        let kind = queue(this).kind;
+        let n = BY_KIND[(kind as usize).min(7)].fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            tracing::info!(
+                queue = format_args!("{this:p}"),
+                kind,
+                submissions = n,
+                lists = count,
+                "queue submits"
+            );
+        }
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
@@ -164,8 +185,46 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+///
+/// shortcut: a wait for a value the fence has not reached yet is where the
+/// console holds this queue's later work back until another queue signals;
+/// here that work runs at once, before the work it was meant to follow.
+/// Such waits are counted and the first ones logged, to see whether the
+/// title orders its queues this way.
+extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+    static WAITS: AtomicU64 = AtomicU64::new(0);
+    static AHEAD: AtomicU64 = AtomicU64::new(0);
+    let waits = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = crate::fence::value(fence);
+    if now < value {
+        let ahead = AHEAD.fetch_add(1, Ordering::Relaxed) + 1;
+        if ahead <= 16 || ahead.is_power_of_two() {
+            tracing::warn!(
+                queue = format_args!("{this:p}"),
+                kind = queue(this).kind,
+                fence = format_args!("{fence:p}"),
+                wanted = value,
+                now,
+                ahead,
+                waits,
+                "queue wait for a fence value not reached yet: not honoured"
+            );
+        }
+    } else if waits <= 4 || waits.is_power_of_two() {
+        tracing::info!(
+            queue = format_args!("{this:p}"),
+            kind = queue(this).kind,
+            wanted = value,
+            now,
+            waits,
+            ahead = AHEAD.load(Ordering::Relaxed),
+            "queue wait already satisfied"
+        );
+    }
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -227,7 +286,6 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -271,6 +329,8 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::presenting(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);

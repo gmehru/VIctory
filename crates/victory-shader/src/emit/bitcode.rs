@@ -264,6 +264,14 @@ impl Module {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))
     }
+    /// The bits of `v` if it is a 32-bit integer constant.
+    pub fn const_i32(&self, v: V) -> Option<u32> {
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize] {
+            (t, Const::Int(x)) if self.types[t.0 as usize] == TypeDef::Int(32) => Some(*x as u32),
+            _ => None,
+        }
+    }
     pub fn i8(&mut self, v: u8) -> V {
         let t = self.int(8);
         self.int_const(t, i64::from(v as i8))

@@ -12,6 +12,9 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the host's runtime stride table is bound: `t0` in this space
+/// (one `u32` element stride per view-heap slot).
+pub const STRIDE_SPACE: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -19,6 +22,9 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    /// 64-bit atomics on a typed resource, and on one of a descriptor heap.
+    pub const ATOMIC_TYPED64: u64 = 1 << 27;
+    pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
 }
@@ -44,6 +50,11 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+/// A compute program: a thread-group size and no mesh state.
+fn kind_is_compute(threads: Option<[u32; 3]>, mesh: bool) -> bool {
+    threads.is_some() && !mesh
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -54,6 +65,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// Some operation takes derivatives across the lanes of a quad.
+    pub derivatives: bool,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -64,7 +77,11 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
+    pub stride_table: Option<V>,
     pub flags: u64,
+    /// Heap handles made with a non-uniform index.
+    pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -112,12 +129,15 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            derivatives: false,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            stride_table: None,
             flags: 0,
+            nonuniform_handles: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -149,6 +169,8 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Sample, SampleBias, SampleCmp, CalculateLOD, DerivCoarse/Fine X/Y.
+        self.derivatives |= matches!(opcode, 60 | 61 | 64 | 81 | 83..=86);
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -232,6 +254,32 @@ impl Shader {
         h
     }
 
+    /// The handle of the host's runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`], a raw buffer of `u32` byte strides indexed by
+    /// view-heap slot).
+    pub fn stride_table_handle(&mut self) -> V {
+        if let Some(h) = self.stride_table {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(STRIDE_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.stride_table = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -272,14 +320,23 @@ impl Shader {
         )
     }
 
-    /// A descriptor heap handle, annotated with `props`.
-    pub fn heap_handle(&mut self, block: usize, index: V, sampler: bool, props: (u32, u32)) -> V {
+    /// A descriptor heap handle, annotated with `props`; `nonuniform` when
+    /// the index may differ between lanes (`NonUniformResourceIndex`).
+    pub fn heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
         self.flags |= if sampler {
             flags::SAMPLER_HEAP
         } else {
             flags::RESOURCE_HEAP
         };
-        let (s, n) = (self.m.bool(sampler), self.m.bool(false));
+        self.nonuniform_handles += u32::from(nonuniform);
+        let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
             "createHandleFromHeap",
@@ -305,6 +362,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || self.stride_table.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -359,20 +417,28 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || self.stride_table.is_some() {
+                let mut specs: Vec<(u32, u32)> = self
+                    .root_srvs
+                    .iter()
+                    .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                    .collect();
+                if self.stride_table.is_some() {
+                    specs.push((STRIDE_SPACE, 0));
+                }
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, reg)) in specs.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, reg)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -381,8 +447,8 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register: reg,
                         dxil_kind: 11,
                     });
                 }
@@ -525,7 +591,18 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        // Derivatives in a compute shader are shader model 6.6's, but a
+        // validator takes a module that names a validator before 1.8 as one
+        // that may not use them there: such a module names 1.8 (and carries
+        // that version's `PSV0`, see `container::psv`).
+        let late = self.derivatives && kind_is_compute(self.threads, self.mesh.is_some());
+        if late {
+            let eight = i32c(&mut self, 8);
+            let v18 = self.m.md_node(vec![Some(one), Some(eight)]);
+            self.m.named_md("dx.valver", vec![v18]);
+        } else {
+            self.m.named_md("dx.valver", vec![version]);
+        }
         // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -564,6 +641,12 @@ impl Shader {
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
         }
+        if self.flags & flags::ATOMIC_TYPED64 != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_HEAP64 != 0 {
+            features |= 0x1000_0000;
+        }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);
         let osg1 = container::signature(&self.outputs, false);
@@ -582,6 +665,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            entry: late.then_some("main"),
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);

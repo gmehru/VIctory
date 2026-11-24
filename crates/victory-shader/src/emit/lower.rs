@@ -22,6 +22,15 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// A handle's annotation: the resource kind (bit 12 a UAV) and what the
+/// kind takes with it (a typed view's component type and count, a
+/// structured buffer's stride).
+type Props = (u32, u32);
+
+/// What a descriptor's dwords say as numbers needs of its host view: the
+/// handle's annotation, the resource kind of an image, whether it is a UAV.
+type View = (Props, Option<u32>, bool);
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -35,8 +44,12 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub stride_table: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Heap handles made with a non-uniform index.
+    #[cfg(test)]
+    pub nonuniform_handles: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -152,9 +165,18 @@ struct Lower<'a> {
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
+    /// [`Resources::same`] by site.
+    same: HashMap<Site, u32>,
+    /// The copies of [`Source::Held`] descriptors: by the `v_mov_b32`, the
+    /// load, the descriptor's first dword in it, the dword copied.
+    held: HashMap<Site, (Site, u8, u8)>,
+    /// The instruction writing each value, once something asks.
+    def_site: Option<HashMap<Value, Site>>,
+    /// Immediate dominator per IR block, once something asks.
+    idom: Option<Vec<usize>>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, Props), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -206,13 +228,23 @@ struct Lower<'a> {
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
-/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
-/// its data says; data the host has not mirrored yet (a null view reads
+/// [`super::loop_limit_of`] says otherwise. The console runs a loop as long
+/// as its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
 /// until the driver resets it. A lane that reaches the limit leaves the
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// [`LOOP_LIMIT`] for pixel programs. A lit pixel family of Grand Theft
+/// Auto VI was measured at 250-355 ms per draw, as if every lane ran a
+/// loop to 2^20 (a structured view the host left null reads zeros, and its
+/// cascade count of 0 minus 1 never ends the loop); a frame of such draws
+/// runs into the driver's timeout. Pixel programs run per covered pixel, so
+/// a loop there is short in any frame that renders in time.
+// shortcut: a safety net until the views are right; a genuine pixel loop of
+// more iterations than this is cut short and its pixel discarded.
+pub(super) const PIXEL_LOOP_LIMIT: u32 = 1 << 16;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -233,6 +265,132 @@ enum MaskData {
     /// Mesh programs: their lanes and waves (LDS per console wave) are the
     /// console's but no host wave size can be declared.
     None,
+}
+
+/// Dword 1 of what stands in for a sampler held in VGPRs
+/// ([`Source::Held`]): tells it from whatever else the registers hold.
+const HELD_TAG: u32 = 0x5648_4C44;
+
+/// Slots of the largest shader-visible sampler heap D3D12 allows: an index
+/// at or past it is outside every host sampler heap. `victory-gpu` gives
+/// every host sampler heap this many (point samplers past the title's), so
+/// an index below it is inside, whatever the title heap's size.
+const SAMPLER_HEAP_SLOTS: u32 = 2048;
+
+/// Whether a descriptor that differs between lanes ([`Source::Fetched`],
+/// [`Source::Lanes`]) gets a non-uniform heap handle. Off: no program of
+/// Grand Theft Auto VI has those shapes, and the per-lane heap index comes
+/// from title data with no bound on it (an index past the heap can fault
+/// the host GPU), while nothing checks that the access sits in a waterfall
+/// loop (a first-lane access outside one would run in every lane). Such
+/// programs are refused.
+const PER_LANE_HANDLES: bool = false;
+
+/// Whether a structured buffer whose stride is not known at translation
+/// reads it from the host's runtime stride table
+/// ([`Lower::runtime_stride_offset`]). Off: every program this enables in
+/// Grand Theft Auto VI reads a structured view it indexes in the heap
+/// directly, which `victory-gpu` leaves null there (the reads give zeros,
+/// one of them into a mesh program's position export), and a structured or
+/// typed host view read through a raw handle is undefined in D3D12. Such
+/// programs are refused, as before the table existed.
+const RUNTIME_STRIDE: bool = false;
+
+/// 16-bit float operations of one, two and three operands, and 16-bit
+/// integer ones ([`Lower::valu16`]): GFX10 writes their result into half
+/// of the destination and keeps the other half.
+const F16_UNARY: &[&str] = &[
+    "v_rcp_f16",
+    "v_sqrt_f16",
+    "v_rsq_f16",
+    "v_log_f16",
+    "v_exp_f16",
+    "v_fract_f16",
+    "v_trunc_f16",
+    "v_floor_f16",
+    "v_ceil_f16",
+    "v_rndne_f16",
+    "v_sin_f16",
+    "v_cos_f16",
+    "v_cvt_f16_u16",
+    "v_cvt_f16_i16",
+];
+const F16_BINARY: &[&str] = &[
+    "v_add_f16",
+    "v_sub_f16",
+    "v_subrev_f16",
+    "v_mul_f16",
+    "v_max_f16",
+    "v_min_f16",
+];
+const F16_TERNARY: &[&str] = &[
+    "v_fma_f16",
+    "v_mad_f16",
+    "v_fmac_f16",
+    "v_mac_f16",
+    "v_max3_f16",
+    "v_min3_f16",
+    "v_med3_f16",
+];
+const INT16: &[&str] = &[
+    "v_add_nc_u16",
+    "v_sub_nc_u16",
+    "v_subrev_nc_u16",
+    "v_mul_lo_u16",
+    "v_lshlrev_b16",
+    "v_lshrrev_b16",
+    "v_ashrrev_i16",
+    "v_max_u16",
+    "v_max_i16",
+    "v_min_u16",
+    "v_min_i16",
+    "v_cvt_u16_f16",
+    "v_cvt_i16_f16",
+];
+
+/// Vector operations that add onto their destination's old contents.
+const ACCUMULATORS: &[&str] = &[
+    "v_mac_f32",
+    "v_mac_legacy_f32",
+    "v_fmac_f32",
+    "v_fmac_legacy_f32",
+    "v_mac_f16",
+    "v_fmac_f16",
+    "v_dot2c_f32_f16",
+    "v_dot4c_i32_i8",
+    "v_pk_fmac_f16",
+];
+
+/// Whether `inst` writes only part of its destination VGPRs and keeps the
+/// rest: a 16-bit result, an SDWA byte or word whose other bits are
+/// preserved, a 16-bit interpolation, a d16 load.
+fn writes_part(inst: &Inst) -> bool {
+    let name = inst.name();
+    match &inst.fields {
+        Fields::Valu(f) => match f.sdwa {
+            Some(s) if s.dst_sel < 6 => s.dst_unused == 2,
+            Some(_) => false,
+            None => {
+                [F16_UNARY, F16_BINARY, F16_TERNARY, INT16]
+                    .iter()
+                    .any(|l| l.contains(&name))
+                    || matches!(
+                        name,
+                        "v_cvt_f16_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" | "v_interp_p2_f16"
+                    )
+            }
+        },
+        Fields::Image { d16, .. } => *d16 && !name.contains("store"),
+        _ => name.contains("_d16") && !name.contains("store"),
+    }
+}
+
+/// Whether `inst` computes its VGPR result with the destination's old
+/// contents: an accumulator, an interpolation's second step, a write of
+/// part of the register.
+fn reads_old(inst: &Inst) -> bool {
+    let name = inst.name();
+    ACCUMULATORS.contains(&name) || name.starts_with("v_interp_p2") || writes_part(inst)
 }
 
 /// What a value holding a lane mask read as a number stops with.
@@ -457,6 +615,21 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
+            same: x.res.same.iter().copied().collect(),
+            held: x
+                .res
+                .descriptors
+                .iter()
+                .flat_map(|d| d.source.leaves())
+                .filter_map(|l| match l {
+                    Source::Held { copies, .. } => Some(copies),
+                    _ => None,
+                })
+                .flatten()
+                .map(|&(copy, load, first, dword)| (copy, (load, first, dword)))
+                .collect(),
+            def_site: None,
+            idom: None,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -828,6 +1001,23 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        // Descriptors traced through copies into VGPRs as if every lane
+        // had run them: so it is only without a lane guard.
+        for &(b, i) in &self.x.res.whole {
+            let inst = &p.blocks[b].insts[i];
+            let lanes = matches!(&inst.fields, Fields::Valu(f) if f.dpp.is_some());
+            if lanes || self.x.st.guards[b][i].is_some() {
+                return Err(unsupported(
+                    inst.machine.offset,
+                    "a descriptor copied into VGPRs in some lanes only",
+                ));
+            }
+        }
+        // Samplers held in VGPRs: checked for the whole program, whether or
+        // not a sample ends up asking for the handle (a sample's failure
+        // only makes its result missing, and the copies' stand-ins are
+        // written either way).
+        self.held_checks()?;
         self.find_sections();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -882,11 +1072,15 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            #[cfg(test)]
+            nonuniform_handles: self.s.nonuniform_handles,
+            stride_table,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -913,6 +1107,8 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
+                // `ir::build` forwards no spill register read before a store.
+                Reg::Spill(..) => Val::Missing("a spill slot on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
@@ -2870,47 +3066,11 @@ impl<'a> Lower<'a> {
                     _ => None,
                 })
             });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
+        let (first, (props, image, uav)) = match use_at {
+            Some((at, first)) => (first, self.view_at(site, first, at)?),
+            None => self.view_elsewhere(site)?,
         };
         let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
-                {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
-                }
-                (props, None)
-            }
-            _ => return Err("a scalar memory read as data"),
-        };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -2975,6 +3135,132 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The host view of the descriptor at dword `first` of the load at
+    /// `load`, as the instruction at `at` uses it: handle properties, the
+    /// resource kind of an image, and whether it is a UAV.
+    fn view_at(&self, load: Site, first: u8, at: Site) -> Result<View, Why> {
+        let used = self.used_kind(&Source::Loaded { load, first });
+        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+        let un = ui.name();
+        let uav = un.contains("store")
+            || un.contains("atomic")
+            || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let u = if uav { 0x1000 } else { 0 };
+        match &ui.fields {
+            Fields::Image { dim, .. } => {
+                let kind = match dim {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    4 => 6,
+                    5 => 7,
+                    _ => return Err("an image dimension (cube or MSAA)"),
+                };
+                Ok(((kind | u, 0x409), Some(kind), uav))
+            }
+            Fields::Buffer { idxen, format, .. } => {
+                let stride = used.map_or(0, |u| u.stride);
+                let props = if un.starts_with("buffer_load_format")
+                    || un.starts_with("buffer_store_format")
+                {
+                    (10 | u, 0x409)
+                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+                    (12 | u, stride)
+                } else {
+                    (11 | u, 0)
+                };
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                Ok((props, None, uav))
+            }
+            // A scalar load names no element: the table entry tells a raw
+            // buffer (stride 1, sized in bytes) from a structured one,
+            // whose records the code counts and multiplies out itself.
+            // (Typed buffers are not read by scalar loads.)
+            Fields::Smem { .. } if un.starts_with("s_buffer_load_") => match used {
+                Some(u) if u.kind == ResourceType::Cbv => {
+                    Err("a constant buffer's descriptor read as data")
+                }
+                Some(u) if u.kind == ResourceType::Srv && u.stride == 1 => {
+                    Ok(((11, 0), None, false))
+                }
+                Some(u)
+                    if u.kind == ResourceType::Srv
+                        && u.stride >= 4
+                        && u.stride.is_multiple_of(4) =>
+                {
+                    Ok(((12, u.stride), None, false))
+                }
+                _ => Err("a scalar memory read as data"),
+            },
+            _ => Err("a scalar memory read as data"),
+        }
+    }
+
+    /// [`Self::view_at`] for a descriptor load no instruction uses as a
+    /// resource (the dword of the descriptor in it comes first): the code
+    /// loads a heap descriptor again for each use, so the load that reads a
+    /// texture's size is not the one a sample goes through. Another load of
+    /// the same address ([`Resources::same`]) that is used tells the view,
+    /// provided one of the two loads dominates the other (a lane that runs
+    /// the later one has run both, on one descriptor) and all such uses
+    /// agree.
+    // shortcut: a program that names one heap slot as two kinds of view,
+    // and reads sizes through the one it never accesses, gets the other's
+    // kind; shipped code names a slot once.
+    fn view_elsewhere(&mut self, site: Site) -> Result<(u8, View), Why> {
+        const ONLY: Why = "a descriptor read only as data";
+        let class = *self.same.get(&site).ok_or(ONLY)?;
+        let mut found = None;
+        let mut ordered = false;
+        for d in self
+            .x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource)
+        {
+            for leaf in d.source.leaves() {
+                let Source::Loaded { load, first } = *leaf else {
+                    continue;
+                };
+                if self.same.get(&load) != Some(&class) {
+                    continue;
+                }
+                let view = (first, self.view_at(load, first, d.site)?);
+                if found.is_some_and(|f| f != view) {
+                    return Err("a descriptor read as data and used as several views");
+                }
+                found = Some(view);
+                ordered |= self.dominates(site.0, load.0) || self.dominates(load.0, site.0);
+            }
+        }
+        found.filter(|_| ordered).ok_or(ONLY)
+    }
+
+    /// Whether every path to IR block `b` passes through `a`.
+    fn dominates(&mut self, a: usize, mut b: usize) -> bool {
+        let p = self.x.p;
+        let idom = self.idom.get_or_insert_with(|| {
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            let mut index = vec![usize::MAX; p.blocks.len()];
+            for (n, &b) in order.iter().enumerate() {
+                index[b] = n;
+            }
+            crate::ir::idoms(&p.blocks, &order, &index)
+        });
+        loop {
+            if a == b {
+                return true;
+            }
+            if idom[b] == b || idom[b] == usize::MAX {
+                return false;
+            }
+            b = idom[b];
+        }
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -3168,7 +3454,9 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } = src {
+        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
+            src
+        {
             return self.used_kind(args.first()?);
         }
         if let Source::Built { address, .. } = src {
@@ -3180,7 +3468,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
         }
-        let Source::Loaded { load, first } = src else {
+        let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
             return None;
         };
         let a = self.scalar.get(load)?;
@@ -3211,12 +3499,12 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
-                let h = self.s.heap_handle(self.cur, index, sampler, props);
+                let h = self.s.heap_handle(self.cur, index, sampler, false, props);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -3240,6 +3528,92 @@ impl<'a> Lower<'a> {
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
+            Source::Held {
+                words,
+                copies,
+                vgprs,
+                ..
+            } => {
+                if !sampler {
+                    return Err("a resource held in VGPRs");
+                }
+                // What some lane may still hold in each VGPR at the use.
+                // (That stand-ins stay stand-ins, that no immediate sampler
+                // may be there and that the read-backs are a waterfall
+                // loop's are checked for the whole program: `held_checks`.)
+                let mut left = Vec::new();
+                for &v in vgprs {
+                    left.push(self.left_in(v)?);
+                }
+                // Each sampler copied in gives its index and the tag.
+                let mut whole = [Vec::new(), Vec::new()];
+                for &(copy, load, first, dword) in copies {
+                    if dword > 1 || !left[usize::from(dword)].contains(&copy) {
+                        continue;
+                    }
+                    match self.sampler_load(load, first) {
+                        Some(true) => whole[usize::from(dword)].push((load, first)),
+                        Some(false) => {}
+                        None => return Err("a descriptor of unknown kind held in VGPRs"),
+                    }
+                }
+                whole.iter_mut().for_each(|w| {
+                    w.sort_unstable();
+                    w.dedup();
+                });
+                if whole[0].is_empty() || whole[0] != whole[1] {
+                    return Err("a sampler held in VGPRs in part");
+                }
+                // The heap indices a lane's dword 0 may hold as a stand-in:
+                // each known one, or (a table's, whose base is user data)
+                // any index a shader-visible sampler heap has.
+                let (mut known, mut unknown) = (Vec::new(), false);
+                for &(load, first) in &whole[0] {
+                    match self.heap_index_known(load, first, true) {
+                        Some(k) if k < SAMPLER_HEAP_SLOTS => known.push(k),
+                        Some(_) => return Err("a sampler past the sampler heap"),
+                        None => unknown = true,
+                    }
+                }
+                known.sort_unstable();
+                known.dedup();
+                // The tag fails only where a lane holds no sampler at all:
+                // no heap sampler (those carry the tag) and, by
+                // `held_checks`, no immediate one, so an arithmetic result,
+                // loaded data, a lone constant or a register nothing set.
+                // The console would then sample with those bits as sampler
+                // state, which no program can mean. The tag alone does not
+                // vouch for dword 0 (a register reused for data while dword
+                // 1 keeps the tag), so the index must also be one a copy
+                // left there. Otherwise slot 0, which the host always fills
+                // with a point sampler: an index outside the heap can fault
+                // the host GPU.
+                let index = self.i32_of(words[0])?;
+                let tag = self.i32_of(words[1])?;
+                let c = self.cur;
+                let (want, zero) = (self.s.m.i32(HELD_TAG), self.s.m.i32(0));
+                let mut ok = self.s.m.cmp(c, pred::EQ, tag, want);
+                let mut any = None;
+                if unknown {
+                    let slots = self.s.m.i32(SAMPLER_HEAP_SLOTS);
+                    any = Some(self.s.m.cmp(c, pred::IULT, index, slots));
+                }
+                for k in known {
+                    let k = self.s.m.i32(k);
+                    let is = self.s.m.cmp(c, pred::EQ, index, k);
+                    any = Some(match any {
+                        Some(a) => self.s.m.bin(c, Bin::Or, a, is),
+                        None => is,
+                    });
+                }
+                if let Some(a) = any {
+                    ok = self.s.m.bin(c, Bin::And, ok, a);
+                }
+                let index = self.s.m.select(c, ok, index, zero);
+                // Each lane's own index: the read-backs are a waterfall
+                // loop's, lowered as each lane's own dwords.
+                Ok(self.s.heap_handle(c, index, true, true, props))
+            }
             Source::Built { address, .. } => {
                 let rp = *self
                     .x
@@ -3285,8 +3659,635 @@ impl<'a> Lower<'a> {
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
                 let phi = self.s.m.phi(join, self.s.t.i32);
                 self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, props))
+                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
             }
+            Source::Select { scc, args } => {
+                // The heap index of each choice, picked by SCC (uniform).
+                let [
+                    Source::Loaded { load: a, first: fa },
+                    Source::Loaded { load: b, first: fb },
+                ] = args[..]
+                else {
+                    return Err("a descriptor chosen by a condition");
+                };
+                let cond = match self.get(*scc)? {
+                    Val::Bit(x) => x,
+                    _ => return Err("SCC without a value"),
+                };
+                let set = self.heap_index(a, fa, sampler)?;
+                let clear = self.heap_index(b, fb, sampler)?;
+                let index = self.s.m.select(self.cur, cond, set, clear);
+                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+            }
+            Source::Fetched { .. } | Source::Lanes { .. } => {
+                // A descriptor each lane has its own of (a waterfall loop
+                // reads it from the first active lane): each lane's heap
+                // index, non-uniform; switched off (see the constant).
+                if !PER_LANE_HANDLES {
+                    return Err("a descriptor that differs between lanes");
+                }
+                let index = self.lane_heap_index(src, sampler)?;
+                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+            }
+        }
+    }
+
+    /// The heap index of a descriptor that may differ between lanes,
+    /// computed in the current block.
+    fn lane_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Fetched { load, first } => self.fetched_index(*load, *first, sampler),
+            Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
+                let [a, b] = &args[..] else {
+                    return Err("a descriptor chosen per lane");
+                };
+                let cond = if matches!(src, Source::Lanes { .. }) {
+                    let &m = self
+                        .x
+                        .st
+                        .masks
+                        .get(mask)
+                        .ok_or("a descriptor chosen per lane by an untracked mask")?;
+                    self.boolean(m, self.cur)?
+                } else {
+                    match self.get(*mask)? {
+                        Val::Bit(x) => x,
+                        _ => return Err("SCC without a value"),
+                    }
+                };
+                let set = self.lane_heap_index(a, sampler)?;
+                let clear = self.lane_heap_index(b, sampler)?;
+                Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            _ => Err("a per-lane descriptor from neither a heap load nor a choice of them"),
+        }
+    }
+
+    /// The heap index of the descriptor at dword `first` of what the global
+    /// load at `load` reads, in each lane: its address (base plus offsets)
+    /// over the descriptor size.
+    fn fetched_index(&mut self, load: Site, first: u8, sampler: bool) -> Result<V, Why> {
+        const WHY: Why = "a per-lane descriptor load";
+        let a = *self
+            .scalar
+            .get(&load)
+            .ok_or("an untracked descriptor load")?;
+        match self.x.native.layout.get(a.param).map(|p| p.root) {
+            Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
+            _ => return Err("a descriptor outside the heaps"),
+        }
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Flat {
+            addr: Some(Operand::Vector { reg, .. }),
+            saddr,
+            offset,
+            ..
+        } = li.fields
+        else {
+            return Err(WHY);
+        };
+        let c = self.cur;
+        // The low dword of the address: SGPR base plus VGPR offset, or the
+        // VGPR pair's low half (heap addresses fit in 32 bits).
+        let mut at = self.i32_of(li.read(Reg::V(reg)).ok_or(WHY)?)?;
+        if let Some(Operand::Scalar { code, .. }) = saddr
+            && code != NULL
+        {
+            let base = self.i32_of(li.read(Reg::S(code)).ok_or(WHY)?)?;
+            at = self.s.m.bin(c, Bin::Add, base, at);
+        }
+        let k = self
+            .s
+            .m
+            .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
+        at = self.s.m.bin(c, Bin::Add, at, k);
+        let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+    }
+
+    /// The view-heap slot of `src` when it comes from a descriptor table or
+    /// heap (`Loaded` or `Phi` of `Loaded`).
+    fn heap_slot(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
+        match src {
+            Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
+            Source::Phi { block, args } => {
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
+                        return Err("a descriptor chosen by control flow");
+                    };
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let here = std::mem::replace(&mut self.cur, at);
+                    let index = self.heap_index(*load, *first, sampler);
+                    self.cur = here;
+                    incoming.push((index?, at));
+                }
+                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
+            }
+            _ => Err("a descriptor outside the heaps"),
+        }
+    }
+
+    /// Byte offset `index * stride + off` for a structured buffer whose
+    /// stride was not recovered statically, reading `stride` from the host's
+    /// runtime stride table (`t0`, [`super::STRIDE_SPACE`]).
+    fn runtime_stride_offset(&mut self, src: &Source, index: V, off: V) -> Result<V, Why> {
+        // Switched off (see the constant): refused as before.
+        if !RUNTIME_STRIDE {
+            return Err("a structured buffer of unknown stride");
+        }
+        let slot = self
+            .heap_slot(src, false)
+            .map_err(|_| "a structured buffer of unknown stride")?;
+        let c = self.cur;
+        let table = self.s.stride_table_handle();
+        let four = self.s.m.i32(4);
+        let addr = self.s.m.bin(c, Bin::Mul, slot, four);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let res = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, addr, iu, mask, align],
+        );
+        let stride_f = self.s.m.extract(c, res, 0);
+        let stride = self.as_int(stride_f);
+        let elem_off = self.s.m.bin(c, Bin::Mul, index, stride);
+        Ok(self.s.m.bin(c, Bin::Add, elem_off, off))
+    }
+
+    /// The instruction writing each value.
+    fn def_sites(&mut self) -> &HashMap<Value, Site> {
+        let p = self.x.p;
+        self.def_site.get_or_insert_with(|| {
+            let mut sites = HashMap::new();
+            for (b, block) in p.blocks.iter().enumerate() {
+                for (i, inst) in block.insts.iter().enumerate() {
+                    sites.extend(inst.writes.iter().map(|w| (w.1, (b, i))));
+                }
+            }
+            sites
+        })
+    }
+
+    /// The checks that make [`Source::Held`] sound, for the whole program:
+    /// every held sampler is read back by a waterfall loop and cannot be
+    /// an immediate one, and what stands in for the dwords stays a
+    /// stand-in ([`Self::held_stay`]). A failure refuses the program.
+    fn held_checks(&mut self) -> Result<(), Stop> {
+        let x = self.x;
+        let mut held = false;
+        for d in &x.res.descriptors {
+            let offset = x.p.blocks[d.site.0].insts[d.site.1].machine.offset;
+            for leaf in d.source.leaves() {
+                let Source::Held {
+                    backs,
+                    vgprs,
+                    constants,
+                    ..
+                } = leaf
+                else {
+                    continue;
+                };
+                held = true;
+                // A waterfall loop's read-backs are lowered as each lane's
+                // own dwords, so each lane samples with its own sampler.
+                // Any other read-back is the first active host lane's,
+                // which may be a lane the console had switched off, or one
+                // holding another sampler.
+                if !backs.iter().all(|v| x.res.waterfall.reads.contains(v)) {
+                    return Err(unsupported(
+                        offset,
+                        "a sampler held in VGPRs read back outside a waterfall loop",
+                    ));
+                }
+                // Constants in all four at once could be an immediate
+                // sampler, which has no stand-in.
+                if self.may_be_constants(*vgprs, constants) {
+                    return Err(unsupported(
+                        offset,
+                        "a sampler held in VGPRs that may be an immediate one",
+                    ));
+                }
+            }
+        }
+        if held {
+            self.held_stay()
+                .map_err(|(offset, why)| unsupported(offset, why))?;
+        }
+        Ok(())
+    }
+
+    /// Whether what stands in for the dwords of samplers held in VGPRs
+    /// ([`Source::Held`]) reaches only what treats it as the dwords would
+    /// be treated: copies between VGPRs, selects, joins, writes that leave
+    /// it in the lanes they skip, and a waterfall loop's read-back and
+    /// compare; and whether a value read back goes only into such a
+    /// compare, scalar copies and sampler operands. Anything else would
+    /// compute with a heap index where the console computes with sampler
+    /// state: the program is refused (the reader's offset, and why).
+    ///
+    /// A value is followed lane by lane as far as guards tell: a write
+    /// with no guard replaces the register in every lane that reaches it;
+    /// a guarded one (or DPP, a lane write, a write of part of the
+    /// register) may leave the old contents, except to a reader in the same
+    /// block under the same guard, whose lanes all ran the write (unless
+    /// it takes the value from another lane, by DPP, or the write keeps
+    /// part of the register). What computes with its destination's old
+    /// contents (an accumulator, a write of part of it) reads them.
+    fn held_stay(&mut self) -> Result<(), (usize, Why)> {
+        const READ: Why = "a sampler held in VGPRs whose dwords are computed with";
+        let x = self.x;
+        let (p, st, waterfall) = (x.p, x.st, &x.res.waterfall);
+        let copies: HashSet<Site> = self
+            .held
+            .iter()
+            .filter(|&(_, &(load, first, _))| self.sampler_load(load, first) == Some(true))
+            .map(|(&site, _)| site)
+            .collect();
+        let sites = self.def_sites().clone();
+        // The VGPR operands an instruction copies as they are (a modifier
+        // changes the bits: a negation flips a heap index's top bit).
+        let passed = |inst: &Inst| -> Vec<Value> {
+            let Fields::Valu(f) = &inst.fields else {
+                return Vec::new();
+            };
+            let plain = f.sdwa.is_none() && f.abs == 0 && f.neg == 0 && !f.clamp && f.omod == 0;
+            let n = match inst.name() {
+                "v_mov_b32" if plain => 1,
+                "v_cndmask_b32" if plain => 2,
+                _ => 0,
+            };
+            let vgpr = |op: &Operand| match *op {
+                Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+                _ => None,
+            };
+            f.src.iter().take(n).filter_map(vgpr).collect()
+        };
+        // Whether the write at `site` may skip lanes that reach it, or keep
+        // part of the register.
+        let partial = |(b, i): Site| {
+            let inst = &p.blocks[b].insts[i];
+            let lanes = matches!(&inst.fields, Fields::Valu(f)
+                if f.dpp.is_some() || inst.name() == "v_writelane_b32");
+            lanes || st.guards[b][i].is_some() || writes_part(inst)
+        };
+        // Whether the instruction at `site` reads a VGPR operand from
+        // another lane.
+        let other_lane = |(b, i): Site| {
+            let inst: &Inst = &p.blocks[b].insts[i];
+            matches!(&inst.fields, Fields::Valu(f) if f.dpp.is_some())
+        };
+        // Per value: whether its writer puts a stand-in there, and whether
+        // some lane may hold one at all.
+        let mut new: HashMap<Value, bool> = HashMap::new();
+        let mut any: HashMap<Value, bool> = HashMap::new();
+        let old_of = |v: Value| -> Option<Value> {
+            let &(b, i) = sites.get(&v)?;
+            let inst = &p.blocks[b].insts[i];
+            let &(reg, _) = inst.writes.iter().find(|w| w.1 == v)?;
+            inst.read(reg)
+        };
+        // Whether the reader at `at` may see a stand-in in `v`.
+        let seen = |v: Value, at: Site, new: &HashMap<Value, bool>, any: &HashMap<Value, bool>| {
+            let get = |m: &HashMap<Value, bool>, v: Value| m.get(&v).copied().unwrap_or(false);
+            if self.phi_at.contains_key(&v) {
+                return get(any, v);
+            }
+            let Some(&w) = sites.get(&v) else {
+                return false;
+            };
+            if get(new, v) {
+                return true;
+            }
+            let writer = &p.blocks[w.0].insts[w.1];
+            let same = w.0 == at.0
+                && st.guards[w.0][w.1].is_some()
+                && st.guards[w.0][w.1] == st.guards[at.0][at.1]
+                && !matches!(&writer.fields, Fields::Valu(f)
+                    if f.dpp.is_some() || writer.name() == "v_writelane_b32")
+                && !writes_part(writer)
+                && !other_lane(at);
+            partial(w) && !same && old_of(v).is_some_and(|o| get(any, o))
+        };
+        loop {
+            let mut changed = false;
+            for (b, block) in p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    if !matches!(phi.reg, Reg::V(_)) {
+                        continue;
+                    }
+                    let a = phi
+                        .args
+                        .iter()
+                        .any(|a| any.get(a).copied().unwrap_or(false));
+                    if a && any.insert(phi.value, true) != Some(true) {
+                        changed = true;
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    for &(reg, v) in &inst.writes {
+                        if !matches!(reg, Reg::V(_)) {
+                            continue;
+                        }
+                        let n = copies.contains(&(b, i))
+                            || passed(inst)
+                                .into_iter()
+                                .any(|x| seen(x, (b, i), &new, &any));
+                        let old = inst
+                            .read(reg)
+                            .is_some_and(|o| *any.get(&o).unwrap_or(&false));
+                        let a = n || partial((b, i)) && old;
+                        if n && new.insert(v, true) != Some(true) {
+                            changed = true;
+                        }
+                        if a && any.insert(v, true) != Some(true) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Every reader of a VGPR as a source. Of compares, only a waterfall
+        // loop's (a read-back against the VGPR it read), which is lowered
+        // as true without looking at the dwords; any other would compare
+        // a heap index where the console compares sampler state.
+        let mut back = Vec::new();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let name = inst.name();
+                let mut sources: Vec<Value> = Vec::new();
+                let mut allowed = false;
+                match &inst.fields {
+                    Fields::Valu(f) if !name.contains("rel") && name != "v_swap_b32" => {
+                        for op in &f.src {
+                            if let Operand::Vector { reg, dwords } = *op {
+                                let read = |d| inst.read(Reg::V(reg + d));
+                                sources.extend((0..dwords).filter_map(read));
+                            }
+                        }
+                        if reads_old(inst)
+                            && let Some(Operand::Vector { reg, dwords }) = f.dst
+                        {
+                            let read = |d| inst.read(Reg::V(reg + d));
+                            sources.extend((0..dwords).filter_map(read));
+                        }
+                        let read_back = inst
+                            .writes
+                            .first()
+                            .is_some_and(|w| waterfall.reads.contains(&w.1));
+                        allowed = !passed(inst).is_empty()
+                            || name == "v_readfirstlane_b32" && read_back
+                            || waterfall.compares.contains(&(b, i));
+                    }
+                    Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. } => {}
+                    // Memory, export and interpolation operands, and what
+                    // moves registers by index: every VGPR read but the old
+                    // contents of a result (an atomic's data is both, and a
+                    // result of part of the register or an interpolation's
+                    // second step computes with them).
+                    _ => {
+                        let moved = matches!(inst.fields, Fields::Valu(_));
+                        let old = moved || name.contains("atomic") || reads_old(inst);
+                        let written = |r: Reg| inst.write(r).is_some() && !old;
+                        let vgprs = inst.reads.iter().filter(|r| matches!(r.0, Reg::V(_)));
+                        sources.extend(vgprs.filter(|r| !written(r.0)).map(|r| r.1));
+                    }
+                }
+                let tagged = sources.iter().any(|&x| seen(x, (b, i), &new, &any));
+                if tagged && !allowed {
+                    return Err((inst.machine.offset, READ));
+                }
+                if tagged && name == "v_readfirstlane_b32" {
+                    back.extend(inst.writes.iter().map(|w| w.1));
+                }
+            }
+        }
+        // What is read back: waterfall compares, copies, sampler operands.
+        loop {
+            let before = back.len();
+            for (b, block) in p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    if phi.args.iter().any(|a| back.contains(a)) && !back.contains(&phi.value) {
+                        back.push(phi.value);
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    for &(reg, v) in &inst.reads {
+                        if !back.contains(&v) {
+                            continue;
+                        }
+                        let offset = inst.machine.offset;
+                        let Reg::S(code) = reg else {
+                            return Err((offset, READ));
+                        };
+                        let name = inst.name();
+                        let ok = match &inst.fields {
+                            Fields::Image {
+                                sampler:
+                                    Some(Operand::Scalar {
+                                        code: first,
+                                        dwords,
+                                    }),
+                                ..
+                            } => (*first..*first + *dwords).contains(&code),
+                            Fields::Valu(_) => waterfall.compares.contains(&(b, i)),
+                            Fields::Sop { .. } if name == "s_mov_b32" || name == "s_mov_b64" => {
+                                for &(_, w) in &inst.writes {
+                                    if !back.contains(&w) {
+                                        back.push(w);
+                                    }
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        if !ok {
+                            return Err((offset, READ));
+                        }
+                    }
+                }
+            }
+            if back.len() == before {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Whether some lane may hold constants in all four of `vgprs` at once
+    /// (`constants`: the instructions that put one there, by dword): what
+    /// an immediate sampler copied into them would be. Joins are followed
+    /// together (a lane that came one way holds every register's value for
+    /// that way), a guarded write as either its result or what was there.
+    /// Too many cases to follow count as possible.
+    fn may_be_constants(&mut self, vgprs: [Value; 4], constants: &[(Site, u8)]) -> bool {
+        const LIMIT: usize = 1 << 16;
+        let p = self.x.p;
+        let st = self.x.st;
+        let sites = self.def_sites().clone();
+        let (mut seen, mut todo) = (HashSet::new(), vec![vgprs]);
+        while let Some(quad) = todo.pop() {
+            if !seen.insert(quad) {
+                continue;
+            }
+            if seen.len() > LIMIT {
+                return true;
+            }
+            // The latest join among the four, taken edge by edge.
+            let join = quad
+                .iter()
+                .filter_map(|v| self.phi_at.get(v).map(|&(b, _)| b))
+                .max_by_key(|&b| self.rpo[b]);
+            if let Some(b) = join {
+                for n in 0..p.blocks[b].preds.len() {
+                    let mut next = quad;
+                    for v in &mut next {
+                        if let Some(&(pb, i)) = self.phi_at.get(v)
+                            && pb == b
+                        {
+                            *v = p.blocks[b].phis[i].args[n];
+                        }
+                    }
+                    todo.push(next);
+                }
+                continue;
+            }
+            // No join left: each holds what an instruction wrote, or what
+            // it had on entry. The first that is no constant must be
+            // something the writer passed on or left.
+            let mut all = true;
+            for (k, &v) in quad.iter().enumerate() {
+                let Some(&(b, i)) = sites.get(&v) else {
+                    all = false;
+                    break;
+                };
+                if constants.contains(&((b, i), k as u8)) {
+                    continue;
+                }
+                all = false;
+                let inst = &p.blocks[b].insts[i];
+                let mut others = Vec::new();
+                if let Fields::Valu(f) = &inst.fields {
+                    let n = match inst.name() {
+                        "v_mov_b32" if f.sdwa.is_none() => 1,
+                        "v_cndmask_b32" if f.sdwa.is_none() => 2,
+                        _ => 0,
+                    };
+                    for op in f.src.iter().take(n) {
+                        if let Operand::Vector { reg, .. } = *op {
+                            others.extend(inst.read(Reg::V(reg)));
+                        }
+                    }
+                    if f.dpp.is_some() || inst.name() == "v_writelane_b32" {
+                        others.extend(
+                            inst.writes
+                                .iter()
+                                .filter(|w| w.1 == v)
+                                .filter_map(|w| inst.read(w.0)),
+                        );
+                    }
+                }
+                if st.guards[b][i].is_some() {
+                    others.extend(
+                        inst.writes
+                            .iter()
+                            .filter(|w| w.1 == v)
+                            .filter_map(|w| inst.read(w.0)),
+                    );
+                }
+                for o in others {
+                    let mut next = quad;
+                    next[k] = o;
+                    todo.push(next);
+                }
+                break;
+            }
+            if all {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The instructions whose result some lane may still hold in VGPR value
+    /// `v`: its writer; what that copies or selects from other VGPRs; and,
+    /// where the writer leaves lanes that reach it unwritten (a guard, DPP,
+    /// a lane write), what the register held before.
+    fn left_in(&mut self, v: Value) -> Result<HashSet<Site>, Why> {
+        let p = self.x.p;
+        let sites = self.def_sites().clone();
+        let (mut left, mut seen, mut todo) = (HashSet::new(), HashSet::new(), vec![v]);
+        while let Some(v) = todo.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if let Some(&(b, i)) = self.phi_at.get(&v) {
+                todo.extend(&p.blocks[b].phis[i].args);
+                continue;
+            }
+            // On entry: nothing an instruction left.
+            let Some(&(b, i)) = sites.get(&v) else {
+                continue;
+            };
+            left.insert((b, i));
+            let inst = &p.blocks[b].insts[i];
+            let Some(&(Reg::V(reg), _)) = inst.writes.iter().find(|w| w.1 == v) else {
+                return Err("a descriptor held outside VGPRs");
+            };
+            let mut partial = self.x.st.guards[b][i].is_some();
+            if let Fields::Valu(f) = &inst.fields {
+                let name = inst.name();
+                if name == "v_swap_b32" || name.contains("rel") {
+                    return Err("a descriptor held in VGPRs moved by index");
+                }
+                partial |= f.dpp.is_some() || name == "v_writelane_b32";
+                let passes = match name {
+                    "v_mov_b32" => 1,
+                    "v_cndmask_b32" => 2,
+                    _ => 0,
+                };
+                for op in f.src.iter().take(passes) {
+                    if let Operand::Vector { reg, .. } = *op
+                        && let Some(x) = inst.read(Reg::V(reg))
+                    {
+                        todo.push(x);
+                    }
+                }
+            }
+            if partial && let Some(old) = inst.read(Reg::V(reg)) {
+                todo.push(old);
+            }
+        }
+        Ok(left)
+    }
+
+    /// Whether the descriptor at dword `first` of the load at `load` is a
+    /// sampler: by the heap it comes from, or by its table's entry (`None`:
+    /// no entry says).
+    fn sampler_load(&self, load: Site, first: u8) -> Option<bool> {
+        let a = self.scalar.get(&load)?;
+        match self.x.native.layout.get(a.param)?.root {
+            RootType::SamplerHeap => Some(true),
+            RootType::ResourceHeap => Some(false),
+            RootType::Table => {
+                let used = self.used_kind(&Source::Loaded { load, first })?;
+                Some(used.kind == ResourceType::Sampler)
+            }
+            _ => None,
         }
     }
 
@@ -3330,11 +4331,62 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
     }
 
+    /// [`Self::heap_index`] when translation knows it: the heap's base (0
+    /// for the heaps themselves) and the offsets are constants.
+    fn heap_index_known(&self, load: Site, first: u8, sampler: bool) -> Option<u32> {
+        let li: &Inst = &self.x.p.blocks[load.0].insts[load.1];
+        let Fields::Smem {
+            base,
+            offset,
+            soffset,
+            ..
+        } = &li.fields
+        else {
+            return None;
+        };
+        let Operand::Scalar { code, .. } = *base else {
+            return None;
+        };
+        let soffset = match *soffset {
+            Operand::Scalar { code: NULL, .. } => 0,
+            Operand::Scalar { code, .. } => self.known(li.read(Reg::S(code))?)?,
+            Operand::Const(c) => crate::resource::inline(c)?,
+            Operand::Literal(x) => x,
+            _ => return None,
+        };
+        let addr = self
+            .known(li.read(Reg::S(code))?)?
+            .wrapping_add(*offset as u32)
+            .wrapping_add(4 * u32::from(first))
+            .wrapping_add(soffset);
+        Some(addr >> if sampler { 4 } else { 5 })
+    }
+
+    /// The value of `v` if translation knows it (a constant, or a heap's
+    /// base, which is 0), without lowering anything.
+    fn known(&self, v: Value) -> Option<u32> {
+        match self.vals.get(&v) {
+            Some(&Val::I32(x)) => self.s.m.const_i32(x),
+            Some(_) => None,
+            None => {
+                let &(param, _) = self.params.get(&v)?;
+                let root = self.x.native.layout.get(param)?.root;
+                matches!(root, RootType::ResourceHeap | RootType::SamplerHeap).then_some(0)
+            }
+        }
+    }
+
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
+        if self.x.res.waterfall.compares.contains(&(b, i)) {
+            // The first lane's dwords of a waterfall loop are each lane's
+            // own (see `resource::Waterfall`).
+            self.lane(inst, Some(true));
+            return Ok(());
+        }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
             let r = if v.dpp.is_some() {
                 Err("a compare with DPP")
@@ -3356,6 +4408,19 @@ impl<'a> Lower<'a> {
                 (g, e) => g.or(e),
             };
             self.src0 = Some(x);
+        }
+        // A sampler's dword on its way into the VGPRs that hold it: the
+        // heap index, the tag and zeros stand in (see [`Source::Held`]).
+        if name == "v_mov_b32"
+            && let Some(&(load, first, dword)) = self.held.get(&(b, i))
+            && self.sampler_load(load, first) == Some(true)
+        {
+            let x = match dword {
+                0 => self.heap_index(load, first, true)?,
+                1 => self.s.m.i32(HELD_TAG),
+                _ => self.s.m.i32(0),
+            };
+            return self.write_i(inst, x, guard);
         }
         let r = self.valu_op(inst, guard);
         self.src0 = None;
@@ -3992,17 +5057,69 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
+            "v_readfirstlane_b32"
+                if inst
+                    .writes
+                    .first()
+                    .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)) =>
+            {
+                // A waterfall loop's read of a descriptor dword: the lane's own.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readfirstlane_b32" => {
+                // The console reads the first lane in EXEC; the host, the
+                // first lane active here. Without a guard every lane that
+                // gets here has its EXEC bit set (structurisation proved
+                // it), so the host reads a lane the console has on: the
+                // same value wherever that is the same in the console's
+                // EXEC lanes (what the compiler reads back this way), and a
+                // waterfall over addresses (`v_cmpx_eq` against the VGPR
+                // read, the access, the lanes it served taken out of EXEC)
+                // still serves at least the lane read in each pass, in any
+                // wave size or lane order. With a guard, lanes the console
+                // has switched off get here too and may come first (a
+                // waterfall would then serve no lane and run until the loop
+                // limit): the first lane where the guard holds is read.
+                // shortcut: a value that differs between the console's EXEC
+                // lanes outside a waterfall (a deliberate first-lane
+                // broadcast) is the host wave's first lane's, not the
+                // console wave's.
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let i32t = self.s.t.i32;
+                let first = self
+                    .s
+                    .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[a]);
+                let r = match guard {
+                    None => first,
+                    Some(g) => {
+                        // The lowest set bit of the guard's ballot (host
+                        // waves up to 128 lanes: four dwords); -1 for none.
+                        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                        let ballot =
+                            self.s
+                                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[g]);
+                        let (none, zero) = (self.s.m.i32(u32::MAX), self.s.m.i32(0));
+                        let mut lane = none;
+                        for k in (0..4u32).rev() {
+                            let d = self.s.m.extract(c, ballot, k);
+                            let low = self
+                                .s
+                                .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[d]);
+                            let base = self.s.m.i32(32 * k);
+                            let at = self.s.m.bin(c, Bin::Add, low, base);
+                            let set = self.s.m.cmp(c, pred::NE, d, zero);
+                            lane = self.s.m.select(c, set, at, lane);
+                        }
+                        // None: no lane of this wave is in the read's EXEC;
+                        // the first active lane's value stands in.
+                        let empty = self.s.m.cmp(c, pred::EQ, lane, none);
+                        let lane = self.s.m.select(c, empty, zero, lane);
+                        let picked = self.read_lane(a, lane);
+                        self.s.m.select(c, empty, first, picked)
+                    }
+                };
                 int(self, r)
             }
             _ => {
@@ -4048,6 +5165,17 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    /// Two dwords as an i64.
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let k32 = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, k32);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -4166,61 +5294,13 @@ impl<'a> Lower<'a> {
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
-        const FLOAT2: &[&str] = &[
-            "v_add_f16",
-            "v_sub_f16",
-            "v_subrev_f16",
-            "v_mul_f16",
-            "v_max_f16",
-            "v_min_f16",
-        ];
-        const FLOAT3: &[&str] = &[
-            "v_fma_f16",
-            "v_mad_f16",
-            "v_fmac_f16",
-            "v_mac_f16",
-            "v_max3_f16",
-            "v_min3_f16",
-            "v_med3_f16",
-        ];
-        const FLOAT1: &[&str] = &[
-            "v_rcp_f16",
-            "v_sqrt_f16",
-            "v_rsq_f16",
-            "v_log_f16",
-            "v_exp_f16",
-            "v_fract_f16",
-            "v_trunc_f16",
-            "v_floor_f16",
-            "v_ceil_f16",
-            "v_rndne_f16",
-            "v_sin_f16",
-            "v_cos_f16",
-            "v_cvt_f16_u16",
-            "v_cvt_f16_i16",
-        ];
-        const INT: &[&str] = &[
-            "v_add_nc_u16",
-            "v_sub_nc_u16",
-            "v_subrev_nc_u16",
-            "v_mul_lo_u16",
-            "v_lshlrev_b16",
-            "v_lshrrev_b16",
-            "v_ashrrev_i16",
-            "v_max_u16",
-            "v_max_i16",
-            "v_min_u16",
-            "v_min_i16",
-            "v_cvt_u16_f16",
-            "v_cvt_i16_f16",
-        ];
-        let all = [FLOAT1, FLOAT2, FLOAT3, INT];
+        let all = [F16_UNARY, F16_BINARY, F16_TERNARY, INT16];
         if !all.iter().any(|l| l.contains(&name))
             && !matches!(name, "v_cvt_f16_f32" | "v_cvt_f32_f16")
         {
             return None;
         }
-        Some(self.valu16_op(inst, name, guard, FLOAT1, FLOAT2, FLOAT3))
+        Some(self.valu16_op(inst, name, guard, F16_UNARY, F16_BINARY, F16_TERNARY))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5318,12 +6398,17 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // dmask: the data dwords (cmpswap: twice the value's). Two
+            // dwords per value are one 64-bit integer, low dword first, in
+            // the two 32-bit channels of the texel: shader model 6.6's
+            // 64-bit atomics on a typed resource, which the host views as
+            // R32G32_UINT and the handle declares a 64-bit unsigned view.
+            let compare = code == u32::MAX;
+            let wide = match (compare, *dmask) {
+                (false, 1) | (true, 3) => false,
+                (false, 3) | (true, 15) => true,
+                _ => return Err("an image atomic of other than one or two dwords"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5332,29 +6417,50 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
+            let width: usize = if wide { 2 } else { 1 };
+            let count = if compare { 2 * width } else { width };
+            let vals = self.vgprs(inst, data, count as u8)?;
+            // Dwords `at..` of the data as one value.
+            let whole = |l: &mut Self, at: usize| {
+                if wide {
+                    l.join64(vals[at], vals[at + 1])
+                } else {
+                    vals[at]
+                }
+            };
+            let (ty, component, suffix) = if wide {
+                // The view is always one of the heap's.
+                self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
+                (self.s.m.int(64), 0x107, "i64")
+            } else {
+                (self.s.t.i32, 0x105, "i32")
+            };
+            let mut value = whole(self, 0);
             if op == "sub" {
-                let z = self.s.m.i32(0);
+                let z = self.s.m.int_const(ty, 0);
                 value = self.s.m.bin(c, Bin::Sub, z, value);
             }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
-            };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            // Lanes outside the guard keep what the result registers held.
+            let mut old = Vec::new();
+            for k in 0..width as u8 {
+                old.push(match inst.read(Reg::V(reg + k)) {
+                    Some(v) if cache.glc => self.i32_of(v)?,
+                    _ => self.s.m.i32(0),
+                });
+            }
+            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
+            let r = if compare {
                 // cmpswap: data is (new, compare).
+                let comparand = whole(self, width);
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
+                args.extend([comparand, value]);
                 self.s.op(
                     self.cur,
-                    "atomicCompareExchange.i32",
+                    &format!("atomicCompareExchange.{suffix}"),
                     Attr::NoUnwind,
-                    i32t,
+                    ty,
                     79,
                     &args,
                 )
@@ -5362,12 +6468,26 @@ impl<'a> Lower<'a> {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                self.s.op(
+                    self.cur,
+                    &format!("atomicBinOp.{suffix}"),
+                    Attr::NoUnwind,
+                    ty,
+                    78,
+                    &args,
+                )
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let parts = if wide {
+                let (lo, hi) = self.split64(r);
+                vec![(lo, old[0]), (hi, old[1])]
+            } else {
+                vec![(r, old[0])]
+            };
+            let parts = self.end_guarded(at, &parts);
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                for (k, x) in parts.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, None);
+                }
             }
             return Ok(());
         }
@@ -5904,11 +7024,15 @@ impl<'a> Lower<'a> {
             let (h, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        (
+                            self.handle(site, src, false, (12 | u, stride))?,
+                            [index, off, iu],
+                        )
+                    } else {
+                        let byte = self.runtime_stride_offset(src, index, off)?;
+                        (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -5987,11 +7111,14 @@ impl<'a> Lower<'a> {
                 match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
+                        if stride >= 4 && stride.is_multiple_of(4) {
+                            args.push(self.handle(site, src, false, (12 | u, stride))?);
+                            args.extend([index, off]);
+                        } else {
+                            let byte = self.runtime_stride_offset(src, index, off)?;
+                            args.push(self.handle(site, src, false, (11 | u, 0))?);
+                            args.extend([byte, iu]);
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -6048,18 +7175,28 @@ impl<'a> Lower<'a> {
             match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
+                    if stride >= 4 && stride.is_multiple_of(4) {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    } else {
+                        let byte = self.runtime_stride_offset(src, index, off)?;
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, byte, iu, mask, align],
+                        )
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
@@ -6463,7 +7600,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
+        let limit = self.s.m.i32(super::loop_limit_of(self.x.native.stage));
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -6544,10 +7681,14 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
+                // The mask structurisation saw on this edge; a join it did
+                // not record is of masks known by their low dword.
+                let m = match self.x.st.joins.get(&phi.value).and_then(|j| j.get(n)) {
+                    Some(&m) => m,
+                    None => *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
                         unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                    })?,
+                };
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
@@ -6559,8 +7700,10 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::{Lowered, Numeric, Parts, buffer_format, lower};
+    use crate::native::{
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6598,6 +7741,67 @@ mod tests {
         .map(|_| ())
     }
 
+    /// Lowers a compute program with the root parameters `layout` (in user
+    /// SGPRs from s0 on) and the used resources `used`.
+    fn lower_with(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+    ) -> Result<Lowered, crate::ShaderError> {
+        lower_wave(words, layout, used, false)
+    }
+
+    /// [`lower_with`] in wave64 if `wave64`.
+    fn lower_wave(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 256,
+            layout,
+            used,
+            io: StageIo::Cs(ComputeIo {
+                // The layout's user SGPRs (at least two), 512 bytes of LDS.
+                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    /// Root parameter `slot` in user SGPRs from `user_data` on.
+    fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
+        RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: if root == RootType::Descriptor { 2 } else { 1 },
+            base_register: 0,
+            user_data,
+            slot,
+        }
+    }
+
     #[test]
     fn a_scalar_carry_chain_reaches_the_select() {
         // The high dword of a 64-bit add or subtract, then a select on the
@@ -6627,6 +7831,94 @@ mod tests {
         ];
         for words in [add, sub] {
             lowers(&words).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_descriptor_selected_by_scc_picks_its_heap_index() {
+        // Two buffer descriptors loaded from the table at s0, one picked by
+        // a root constant (s1) with s_cselect_b64 per half, and loaded
+        // through by index and stored to LDS so the load is needed.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF408_0302,
+            0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+            0xE030_2000,
+            0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        // Both are structured buffers of dwords in the table's range.
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// Tables of 2D textures at s0 and samplers at s1.
+    fn texture_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let range = |kind, user_data, slot| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: if kind == ResourceType::Sampler { 4 } else { 8 },
+            user_data,
+            slot,
+        };
+        (
+            vec![root(RootType::Table, 0, 0), root(RootType::Table, 1, 1)],
+            vec![
+                range(ResourceType::Srv, 0, 0),
+                range(ResourceType::Sampler, 1, 1),
+            ],
+        )
+    }
+
+    /// Waterfall loops over descriptors each lane loads or picks itself
+    /// are traced, but their per-lane handles are switched off
+    /// (`PER_LANE_HANDLES`): the programs are refused.
+    #[test]
+    fn waterfall_loops_over_per_lane_descriptors_are_refused() {
+        use crate::resource::tests::{
+            WATERFALL_FETCHED_WAVE32, WATERFALL_FETCHED_WAVE64, WATERFALL_PICKED_WAVE32,
+        };
+        for (words, wave64) in [
+            (WATERFALL_FETCHED_WAVE32, false),
+            (WATERFALL_FETCHED_WAVE64, true),
+            (WATERFALL_PICKED_WAVE32, false),
+        ] {
+            let (layout, used) = texture_tables();
+            let r = lower_wave(words, layout, used, wave64);
+            assert!(
+                matches!(
+                    r,
+                    Err(crate::ShaderError::Unsupported {
+                        what: "a descriptor that differs between lanes",
+                        ..
+                    })
+                ),
+                "{:?}",
+                r.map(|l| l.nonuniform_handles)
+            );
         }
     }
 

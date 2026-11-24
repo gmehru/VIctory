@@ -37,22 +37,28 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop limits, which a
+/// diagnostics build can change at run time: other stages' and pixel
+/// programs', which an override of 2^20 tells apart only together).
 fn build() -> &'static [u8; 32] {
+    use victory_shader::emit::{
+        DEFAULT_LOOP_LIMIT, DEFAULT_PIXEL_LOOP_LIMIT, loop_limit, loop_limit_of,
+    };
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
-        let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        let limits = [loop_limit(), loop_limit_of(HwStage::Ps)];
+        if limits != [DEFAULT_LOOP_LIMIT, DEFAULT_PIXEL_LOOP_LIMIT] {
             tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+                limit = limits[0],
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops of every stage stop at this limit"
             );
         }
         match exe {
             Ok(mut bytes) => {
-                bytes.extend_from_slice(&limit.to_le_bytes());
+                for limit in limits {
+                    bytes.extend_from_slice(&limit.to_le_bytes());
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -131,7 +137,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -210,6 +216,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, u32::from(s.stride_table));
     out
 }
 
@@ -266,6 +273,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +282,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        stride_table,
     })
 }
 
@@ -300,6 +309,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            stride_table: true,
         }
     }
 

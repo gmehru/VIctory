@@ -78,6 +78,10 @@ extern "system" fn release(this: This) -> u32 {
 extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
+/// The fence's value now (for the queue's wait accounting).
+pub(crate) fn value(this: This) -> u64 {
+    fence(this).value.load(Ordering::Acquire)
+}
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());

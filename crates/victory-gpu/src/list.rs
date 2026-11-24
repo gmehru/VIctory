@@ -1118,6 +1118,18 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    RECORDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Draws recorded since the start, never reset (diagnostics: frames
+/// captured counting from the first world frame).
+#[cfg(all(windows, feature = "diagnostics"))]
+static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn recorded_draws() -> u64 {
+    RECORDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -1215,7 +1227,26 @@ pub(crate) fn take_counts() -> (u64, u64) {
 /// A GPU wait for a memory value `(address, comparison, reference, ...)`.
 /// Lists run one after another and to completion, so a value another queue
 /// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    // Counted and the first ones logged: how much the title orders its GPU
+    // work with waits this build does not honour.
+    static WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        let mut now = [0u8; 8];
+        let read = address != 0 && crate::host::read_into(address as *const u8, &mut now);
+        tracing::warn!(
+            list = format_args!("{this:p}"),
+            address = format_args!("{address:#x}"),
+            comparison,
+            reference,
+            now = format_args!("{:#x}", u64::from_le_bytes(now)),
+            read,
+            waits = n,
+            "list waits for a memory value: not honoured"
+        );
+    }
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a

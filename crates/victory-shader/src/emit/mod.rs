@@ -25,18 +25,25 @@
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
 //!   a heap sampler it uses must be a comparison sampler on the host.
-//! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
-//!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
-//!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
-//!   address the title sets is the buffer's.
+//! * **Root CBVs and root SRVs** (raw buffers) at `b<i>` / `t<i>` in
+//!   [`ROOT_CBV_SPACE`], `i` the title's root parameter index
+//!   ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the address
+//!   the title sets is the buffer's. The shader reads either from a root
+//!   descriptor or from a descriptor table of one view at that register:
+//!   victory-gpu binds root CBVs as root descriptors and root SRVs as
+//!   tables of one raw view, from the address to the end of the buffer's
+//!   host copy, so reads past the copy return zeros (its
+//!   `draw::BOUNDED_ROOT_SRVS`). The host harness (`host`) builds the same
+//!   shape.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
 //!   instruction, so the translation reads raw bytes and converts them
 //!   itself. Their descriptors are built around a root SRV (stride 1, no
-//!   record limit): the host binds the root SRV `t<slot>` above with the
-//!   address the title sets, nothing more. The vertex index, the stride
+//!   record limit): the host binds the root SRV `t<slot>` above at the
+//!   address the title sets (bounded by its host copy, as above), nothing
+//!   more. The vertex index, the stride
 //!   and the attribute offset are the shader's own arithmetic on data in
 //!   that buffer (per-stream headers), not descriptor fields.
 //! * **Buffer views in the heap** are declared by how the shader reads
@@ -52,8 +59,13 @@
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
-//!   host's view at that index must be an R32 integer view (64-bit atomics
-//!   stop the translation). Global loads from a root SRV read it raw.
+//!   host's view at that index must be an R32 integer view. An atomic on
+//!   two dwords is one 64-bit integer in a two-channel texel: the handle
+//!   is a 64-bit unsigned view, the host's view must be R32G32_UINT, and
+//!   the device must have shader model 6.6's 64-bit atomics on typed and
+//!   on descriptor-heap resources (the shader declares both; a device
+//!   without them refuses the pipeline). Global loads from a root SRV
+//!   read it raw.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -84,6 +96,8 @@ pub mod host;
 mod lower;
 mod sampler;
 mod shader;
+#[cfg(all(test, windows))]
+mod synth_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -95,44 +109,87 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^20 (pixel programs:
+/// [`DEFAULT_PIXEL_LOOP_LIMIT`]).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+/// Pixel programs' loop limit without an override: 2^16.
+pub const DEFAULT_PIXEL_LOOP_LIMIT: u32 = lower::PIXEL_LOOP_LIMIT;
+
+/// The loop limit override: [`DEFAULT_LOOP_LIMIT`] without one, which
+/// leaves each stage its default ([`loop_limit_of`]).
 ///
 /// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
+/// `0x` hex, at least 1) sets the limit for every stage instead, pixel
+/// programs too (1048576 gives them 2^20 again). A loop that hits the limit
+/// in every lane of a full-screen pass still runs for seconds (2^20 times a
 /// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+/// such loops are what makes a frame slow. The limits are part of the
+/// translation, so the shader cache must key on this and on the pixel
+/// programs' ([`loop_limit_of`] of [`HwStage::Ps`]): an override of 2^20
+/// gives this value the default's but pixel programs another limit
+/// (`victory-gpu`'s cache keys on both).
 pub fn loop_limit() -> u32 {
-    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    loop_override().unwrap_or(DEFAULT_LOOP_LIMIT)
+}
+
+/// The iteration count after which a translated loop of a `stage` program
+/// is left, per lane and per entry into the loop: the override if there is
+/// one ([`loop_limit`]), else [`DEFAULT_PIXEL_LOOP_LIMIT`] for pixel programs
+/// and [`DEFAULT_LOOP_LIMIT`] for the others.
+pub fn loop_limit_of(stage: HwStage) -> u32 {
+    match loop_override() {
+        Some(n) => n,
+        None if stage == HwStage::Ps => DEFAULT_PIXEL_LOOP_LIMIT,
+        None => DEFAULT_LOOP_LIMIT,
+    }
+}
+
+fn loop_override() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         if cfg!(feature = "diagnostics") {
             parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
         } else {
-            lower::LOOP_LIMIT
+            None
         }
     })
 }
 
-/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
-/// unreadable or 0. Pure, for testing.
-fn parse_loop_limit(value: Option<&str>) -> u32 {
+/// `VICTORY_SHADER_LOOP_LIMIT`'s value; none when it is unset, unreadable
+/// or 0. Pure, for testing.
+fn parse_loop_limit(value: Option<&str>) -> Option<u32> {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+    parsed.filter(|&n| n > 0)
+}
+
+/// Whether `native` finds its root arguments through a spill table rather
+/// than in user SGPRs: [`ir::build_with`]'s `spilled`, which reads table
+/// dword `k` as user SGPR `16 + k` where the program loads it. Off: that
+/// read takes the SGPR as it is at the load, not as it was on entry, which
+/// is wrong wherever the program wrote it before (in 12 of the 52 programs
+/// of the Xbox ray-tracing BVH builder, the only ones it applies to), and
+/// with it no program translates anyway (all of them write through root
+/// UAVs or global memory). Sound would be reading the entry values (the
+/// program's input for `S(16 + k)`), and only for ranges on declared
+/// parameters.
+pub fn reads_spill_table(native: &NativeProgram) -> bool {
+    const ON: bool = false;
+    // A compute program whose root arguments all sit past the 16 user
+    // SGPRs finds them through the spill table `s[0:1]` points to.
+    ON && native.stage == HwStage::Cs
+        && !native.layout.is_empty()
+        && native
+            .layout
+            .iter()
+            .all(|r| native.stage.user_sgpr(r.user_data) >= 16)
 }
 
 /// A translated shader and what the host binds for it.
@@ -154,6 +211,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// True when the shader reads the runtime stride table (`t0` in
+    /// [`STRIDE_SPACE`]).
+    pub stride_table: bool,
 }
 
 impl HostShader {
@@ -202,7 +262,8 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let spilled = reads_spill_table(&native);
+    let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
@@ -296,6 +357,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        stride_table: l.stride_table,
     })
 }
 
@@ -393,18 +455,61 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
-    use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{loop_limit, loop_limit_of, loop_override, parse_loop_limit};
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
-        assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
-        assert_eq!(parse_loop_limit(Some("4096")), 4096);
-        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
-        assert_eq!(parse_loop_limit(Some("1")), 1);
+        assert_eq!(parse_loop_limit(None), None);
+        assert_eq!(parse_loop_limit(Some("4096")), Some(4096));
+        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), Some(4096));
+        assert_eq!(parse_loop_limit(Some("1")), Some(1));
+        // The default's value is an override too: it gives pixel programs
+        // 2^20 again.
+        assert_eq!(parse_loop_limit(Some("1048576")), Some(1 << 20));
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
-            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+            assert_eq!(parse_loop_limit(Some(bad)), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn pixel_programs_stop_loops_sooner() {
+        // Only without an override (a diagnostics build may have one).
+        if loop_override().is_some() {
+            return;
+        }
+        assert_eq!(loop_limit(), DEFAULT_LOOP_LIMIT);
+        assert_eq!(loop_limit_of(HwStage::Ps), 1 << 16);
+        for stage in [HwStage::Vs, HwStage::Cs, HwStage::Ms] {
+            assert_eq!(loop_limit_of(stage), 1 << 20, "{stage:?}");
+        }
+    }
+
+    /// The spill table switch is off (see [`reads_spill_table`]) even for a
+    /// compute program whose root arguments all sit past the user SGPRs;
+    /// `ir`'s tests run the rewrite itself.
+    #[test]
+    fn spill_table_loads_stay_loads() {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![crate::RootParam {
+                root: crate::RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        };
+        assert!(native.stage.user_sgpr(16) >= 16);
+        assert!(!reads_spill_table(&native));
     }
     use super::container::SigElement;
     use super::shader::Shader;
@@ -490,6 +595,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            stride_table: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -500,6 +606,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                stride_table: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -593,5 +700,111 @@ mod tests {
         let st = crate::structure::structure(&p).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// Structured buffers whose stride the used-resource entries leave
+    /// unknown: the runtime stride table is switched off (see
+    /// `lower::RUNTIME_STRIDE`), so the store through one is refused.
+    #[test]
+    fn structured_buffer_of_unknown_stride_is_refused() {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0284, // v_mov_b32 v1, 4
+            0xE030_3000,
+            0x8002_0200, // buffer_load_dword v2, v[0:1], s[8:11], 0 idxen offen
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xE070_3000,
+            0x8003_0200, // buffer_store_dword v2, v[0:1], s[12:15], 0 idxen offen
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E06_028A, // v_mov_b32 v3, 10
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xE0C8_3000,
+            0x8003_0300, // buffer_atomic_add v3, v[0:1], s[12:15], 0 idxen offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Srv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let r = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        assert!(
+            matches!(
+                r,
+                Err(crate::ShaderError::Unsupported {
+                    what: "a structured buffer of unknown stride",
+                    ..
+                })
+            ),
+            "{:?}",
+            r.map(|l| l.stride_table)
+        );
     }
 }
