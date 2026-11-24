@@ -16,11 +16,12 @@ use crate::native::{
 use crate::{ShaderError, io, ir, resource, structure};
 
 /// The validator and the host devices do not take several tests at once
-/// (the process dies in them): each test holds this while it runs.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+/// (the process dies in them): each test holds the lock of the other GPU
+/// test modules ([`super::valu_tests::ONE_AT_A_TIME`]) while it runs.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -206,6 +207,7 @@ fn translate(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        per_lane_tables: super::per_lane_tables(native, &p, &res),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
@@ -802,6 +804,26 @@ fn refusal(native: &NativeProgram) -> &'static str {
     }
 }
 
+/// For each sampler operand of `native`, whether tracing takes it as held
+/// in VGPRs ([`resource::Source::Held`]) rather than traced to its loads.
+fn held_samplers(native: &NativeProgram) -> Vec<bool> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let st = structure::structure(&p).ok();
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref()).unwrap();
+    res.descriptors
+        .iter()
+        .filter(|d| d.role == resource::Role::Sampler)
+        .map(|d| {
+            d.source
+                .leaves()
+                .iter()
+                .any(|s| matches!(s, resource::Source::Held { .. }))
+        })
+        .collect()
+}
+
+/// A sampler copied into the VGPRs in every lane is traced to its load
+/// through the waterfall loop (per-lane tracing), not held.
 #[test]
 fn a_sampler_held_in_vgprs_samples() {
     let _serial = serial();
@@ -809,12 +831,17 @@ fn a_sampler_held_in_vgprs_samples() {
     h.copy(1);
     h.sample();
     h.store(0);
-    let shader = translate(&h.program()).unwrap();
+    let native = h.program();
+    assert_eq!(held_samplers(&native), [false]);
+    let shader = translate(&native).unwrap();
     run_held(&shader, 0, |label, out| {
         assert_eq!(out[..8], [WRAP; 8], "{label}");
     });
 }
 
+/// Copied in every lane each time, each sampler is traced to its own load
+/// (per-lane tracing); `held_samplers_reusing_vgprs_sample_with_each_lanes_own_in_turn`
+/// is the held form.
 #[test]
 fn vgprs_reused_by_several_samplers_sample_with_each_in_turn() {
     let _serial = serial();
@@ -824,11 +851,45 @@ fn vgprs_reused_by_several_samplers_sample_with_each_in_turn() {
         h.sample();
         h.store(region);
     }
-    let shader = translate(&h.program()).unwrap();
+    let native = h.program();
+    assert_eq!(held_samplers(&native), [false; 3]);
+    let shader = translate(&native).unwrap();
     run_held(&shader, 0, |label, out| {
         assert_eq!(out[..8], [WRAP; 8], "{label}: the first");
         assert_eq!(out[8..16], [MIRROR; 8], "{label}: the second");
         assert_eq!(out[16..24], [CLAMP; 8], "{label}: the third");
+    });
+}
+
+/// Held samplers one after another in the same VGPRs: each time sampler
+/// `even` is copied in every lane and sampler `odd` over it in the odd
+/// threads, so each loop takes back two samplers, other ones each time
+/// (several copies, several heap indices standing in).
+#[test]
+fn held_samplers_reusing_vgprs_sample_with_each_lanes_own_in_turn() {
+    let _serial = serial();
+    const TURNS: [(u32, u32, u32); 3] = [(0, 1, 2), (1, 2, 0), (2, 0, 1)];
+    let mut h = Held::new();
+    for (region, even, odd) in TURNS {
+        h.copy(even);
+        h.odd_only();
+        h.copy(odd);
+        h.all();
+        h.sample();
+        h.store(region);
+    }
+    let native = h.program();
+    assert_eq!(held_samplers(&native), [true; 3]);
+    let shader = translate(&native).unwrap();
+    let texel = [CLAMP, WRAP, MIRROR];
+    run_held(&shader, 0, |label, out| {
+        for (region, even, odd) in TURNS {
+            let want: Vec<u32> = (0..8)
+                .map(|t| texel[(if t % 2 == 1 { odd } else { even }) as usize])
+                .collect();
+            let at = 8 * region as usize;
+            assert_eq!(out[at..at + 8], want[..], "{label}: turn {region}");
+        }
     });
 }
 
@@ -1792,7 +1853,7 @@ fn an_sgpr_the_hardware_leaves_alone_joins_a_written_one() {
 /// loads, one read directly holds what an earlier wave left, and reads
 /// zero ([`crate::native::ComputeIo::initialized_sgprs`]).
 #[test]
-fn hardware_sgprs_read_otherwise_stay_refused() {
+fn the_scratch_offset_stays_refused_and_sgprs_past_it_read_as_zero() {
     let _serial = serial();
     assert_eq!(refusal(&joined_sgpr(3, 1)), "a hardware SGPR input");
     // Past it, the join is the program's again.
@@ -2101,6 +2162,7 @@ fn constant_vs(ps: &HostShader) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         stride_table: false,
+        per_lane_tables: Vec::new(),
     }
 }
 

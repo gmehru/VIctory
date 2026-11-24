@@ -217,6 +217,12 @@ pub struct HostShader {
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
+    /// Tables (root parameter indices) the shader reads at an offset each
+    /// lane computes: a per-lane descriptor load (`global_load_*`, or a
+    /// waterfall loop's [`resource::Waterfall::loads`]). Such an index may
+    /// reach past the entries the used-resource list names (a descriptor
+    /// array), so the host keeps these tables where the title has them.
+    pub per_lane_tables: Vec<u8>,
 }
 
 impl HostShader {
@@ -371,7 +377,28 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         stride_table: l.stride_table,
+        per_lane_tables: per_lane_tables(native, p, res),
     })
+}
+
+/// [`HostShader::per_lane_tables`]: the table parameters of every access
+/// whose address has a term each lane computes (a global load), or that a
+/// waterfall loop runs with each lane's own entry.
+fn per_lane_tables(native: &NativeProgram, p: &ir::Program, res: &resource::Resources) -> Vec<u8> {
+    let mut slots: Vec<u8> = res
+        .scalar
+        .iter()
+        .filter(|&&(site, a)| {
+            let global = p.blocks[site.0].insts[site.1].name().starts_with("global_");
+            a.dynamic.is_some() && (global || res.waterfall.loads.contains(&site))
+        })
+        .filter_map(|(_, a)| native.layout.get(a.param))
+        .filter(|r| r.root == RootType::Table)
+        .map(|r| r.slot)
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -672,6 +699,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             stride_table: false,
+            per_lane_tables: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -683,6 +711,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                per_lane_tables: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

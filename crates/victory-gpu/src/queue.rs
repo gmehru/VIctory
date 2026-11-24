@@ -199,12 +199,19 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     static AHEAD: AtomicU64 = AtomicU64::new(0);
     let waits = WAITS.fetch_add(1, Ordering::Relaxed) + 1;
     let now = crate::fence::value(fence);
+    // The queue's kind for the logs (`u32::MAX` for a null queue, which no
+    // caller passes).
+    let kind = if this.is_null() {
+        u32::MAX
+    } else {
+        queue(this).kind
+    };
     if now < value {
         let ahead = AHEAD.fetch_add(1, Ordering::Relaxed) + 1;
         if ahead <= 16 || ahead.is_power_of_two() {
             tracing::warn!(
                 queue = format_args!("{this:p}"),
-                kind = queue(this).kind,
+                kind,
                 fence = format_args!("{fence:p}"),
                 wanted = value,
                 now,
@@ -216,7 +223,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     } else if waits <= 4 || waits.is_power_of_two() {
         tracing::info!(
             queue = format_args!("{this:p}"),
-            kind = queue(this).kind,
+            kind,
             wanted = value,
             now,
             waits,

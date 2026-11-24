@@ -154,7 +154,12 @@ pub struct Resources {
     /// form: the same value, or the same operations on the same values,
     /// where each `v_readfirstlane_b32` of one VGPR value counts as one
     /// value (the index the shader's lanes share; the console compiler
-    /// loads a heap descriptor again for each use of it).
+    /// loads a heap descriptor again for each use of it). The exception is
+    /// a waterfall loop's load at the first lane's offset
+    /// ([`Waterfall::loads`]): it reads each lane's own entry, so another
+    /// load with its number may read another lane's. Both read entries
+    /// that lanes' values of the same VGPR name, which is all the lowering
+    /// takes from it: the kind of view a load reads, told by another.
     pub same: Vec<(Site, u32)>,
     pub waterfall: Waterfall,
 }

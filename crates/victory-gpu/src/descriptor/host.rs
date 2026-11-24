@@ -156,6 +156,26 @@ const DYNAMIC: [u32; 2] = [1 << 19, 1 << 18];
 /// more (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// The title slots a view heap keeps and its dynamic slots, for a title
+/// heap of `count` slots, where `fits(n)` makes a host heap of `n` slots
+/// (true if the host took it): the first of [`DYNAMIC`] the host takes on
+/// top of every title slot, else [`MIN_DYNAMIC`]; else, past
+/// [`PORTABLE_VIEWS`], the title's slots cut to leave [`MIN_DYNAMIC`]
+/// within it. `None`: no heap.
+fn view_sizes(count: u32, mut fits: impl FnMut(u32) -> bool) -> Option<(u32, u32)> {
+    DYNAMIC
+        .iter()
+        .chain(&[MIN_DYNAMIC])
+        .find(|&&extra| fits(count.saturating_add(extra)))
+        .map(|&extra| (count, extra))
+        .or_else(|| {
+            // shortcut: descriptors past the host's limit are left out; a
+            // title that reaches them needs remapping.
+            (count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS && fits(PORTABLE_VIEWS))
+                .then_some((PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC))
+        })
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -187,7 +207,8 @@ impl HostHeap {
             0
         };
         // The larger dynamic ranges only where the host takes them on top of
-        // every title slot; else the smallest, and the cap after that.
+        // every title slot; else the smallest, and the cap after that
+        // ([`view_sizes`]).
         let (heap, count, extra) = if sampler {
             match make(count + pad) {
                 Ok(heap) => (heap, count, 0),
@@ -196,21 +217,29 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Some((heap, extra)) = DYNAMIC
-            .iter()
-            .find_map(|&extra| Some((make(count + extra).ok()?, extra)))
-        {
-            (heap, count, extra)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+            let mut made = None;
+            let mut refused = None;
+            let sizes = view_sizes(count, |n| match make(n) {
+                Ok(heap) => {
+                    made = Some(heap);
+                    true
                 }
                 Err(e) => {
+                    refused = Some(e);
+                    false
+                }
+            });
+            match (sizes, made) {
+                (Some((kept, extra)), Some(heap)) => {
+                    if kept < count {
+                        let e = refused.map(|e| e.to_string()).unwrap_or_default();
+                        tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                    }
+                    (heap, kept, extra)
+                }
+                _ => {
+                    let e = refused.map(|e| e.to_string()).unwrap_or_default();
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
                 }
@@ -446,6 +475,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
             self.keep(index, None);
+            self.set_stride(index, 0);
             return;
         }
         let at = self.cpu(index);
@@ -483,6 +513,7 @@ impl HostHeap {
             _ => null_view(at),
         }
         self.keep(index, None);
+        self.set_stride(index, 0);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's). A
@@ -1393,6 +1424,31 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A view heap keeps every title slot and takes the largest dynamic
+    /// range the host takes on top of them; only past the host's limit
+    /// does it give up title slots, and then only for the smallest range.
+    #[test]
+    fn view_heaps_keep_the_title_slots_first() {
+        let capped = |n| n <= PORTABLE_VIEWS;
+        assert_eq!(view_sizes(4, |_| true), Some((4, 1 << 19)));
+        assert_eq!(view_sizes(400_000, capped), Some((400_000, 1 << 19)));
+        assert_eq!(view_sizes(600_000, capped), Some((600_000, 1 << 18)));
+        assert_eq!(view_sizes(900_000, capped), Some((900_000, 1 << 16)));
+        assert_eq!(view_sizes(950_000, capped), Some((934_464, 1 << 16)));
+        // The sizes asked for, in order.
+        let mut asked = Vec::new();
+        let sizes = view_sizes(950_000, |n| {
+            asked.push(n);
+            capped(n)
+        });
+        assert_eq!(sizes, Some((934_464, 1 << 16)));
+        let tried = [19, 18, 16].map(|bits| 950_000 + (1 << bits));
+        assert_eq!(asked, [&tried[..], &[PORTABLE_VIEWS]].concat());
+        // No heap at all, or none within the limit.
+        assert_eq!(view_sizes(4, |_| false), None);
+        assert_eq!(view_sizes(950_000, |n| n < PORTABLE_VIEWS), None);
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.

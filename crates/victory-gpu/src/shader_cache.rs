@@ -137,7 +137,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -217,6 +217,8 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.stride_table));
+    word(&mut out, s.per_lane_tables.len() as u32);
+    out.extend(&s.per_lane_tables);
     out
 }
 
@@ -274,6 +276,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let stride_table = r.word()? != 0;
+    let per_lane_tables = r.list()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -283,6 +286,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         stride_table,
+        per_lane_tables,
     })
 }
 
@@ -310,6 +314,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             stride_table: true,
+            per_lane_tables: vec![1],
         }
     }
 

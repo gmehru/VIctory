@@ -1073,6 +1073,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 stride_table: false,
+                per_lane_tables: Vec::new(),
             };
             let vs = victory_shader::emit::host::stub_vs(&ps).unwrap();
             let outputs = crate::rects::elements(&vs.dxil, victory_shader::FourCC::OSG1).unwrap();

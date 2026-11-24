@@ -4186,7 +4186,10 @@ impl<'a> Lower<'a> {
                 // own dwords, so each lane samples with its own sampler.
                 // Any other read-back is the first active host lane's,
                 // which may be a lane the console had switched off, or one
-                // holding another sampler.
+                // holding another sampler. `resource::track` already
+                // refuses such a program (its waterfall proof takes every
+                // first-lane read of a descriptor, these among them); this
+                // stays so the lowering does not rest on that alone.
                 if !backs.iter().all(|v| x.res.waterfall.reads.contains(v)) {
                     return Err(unsupported(
                         offset,

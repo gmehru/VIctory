@@ -320,6 +320,13 @@ pub(crate) fn take_short_roots() -> [u64; 2] {
 /// before the draw runs is not seen.
 const COPIED_VIEWS: u64 = 64 << 10;
 
+/// Whether table entry `u` may have its table made afresh for a copy of
+/// its view ([`COPIED_VIEWS`]): a buffer shader view, in a table the shader
+/// does not index per lane (`per_lane`, [`State::tables`]).
+fn copies_table(u: &UsedResource, per_lane: &[u8]) -> bool {
+    u.kind == ResourceType::Srv && u.dwords == 4 && !per_lane.contains(&u.slot)
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -722,7 +729,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.per_lane_tables, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -986,13 +993,21 @@ impl State {
     /// from the title's.
     /// shortcut: a table made afresh holds the entries up to the last one
     /// the shader is known to read; a shader indexing past them reads other
-    /// dynamic slots.
+    /// dynamic slots. Tables the shader indexes per lane (`per_lane`,
+    /// [`victory_shader::emit::HostShader::per_lane_tables`]) are not made
+    /// afresh for copied views: their misaligned views stay null.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        per_lane: &[u8],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -1026,9 +1041,17 @@ impl State {
         // shadow cascades, 2044-byte structures the title places anywhere,
         // then loop to the iteration limit and discard every pixel).
         // Unordered access views stay null: a copy would hide what shaders
-        // write from other views of the same memory.
+        // write from other views of the same memory. So do views in tables
+        // the shader indexes per lane: an index past the entries a fresh
+        // table holds would read another list's dynamic slot, of any kind
+        // (a descriptor of another kind read as a buffer gives a wild
+        // address on AMD, #59), where the title's table holds the title's
+        // descriptors.
+        // shortcut: a table indexed by a value every lane shares is still
+        // made afresh, with the same reach past its entries, as it was
+        // before per-lane descriptors were translated.
         for u in used.iter().filter(tables) {
-            if u.kind != ResourceType::Srv || u.dwords != 4 || fresh.contains(&u.slot) {
+            if fresh.contains(&u.slot) || !copies_table(u, per_lane) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1971,6 +1994,30 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 #[cfg(test)]
 mod tests {
     use super::reads_vertex_id;
+
+    /// Only buffer shader views take a fresh table for a copy, and not in a
+    /// table the shader indexes per lane.
+    #[test]
+    fn tables_indexed_per_lane_take_no_copies() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let entry = |kind, dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 2044,
+            dwords,
+            user_data: 2,
+            slot: 3,
+        };
+        let srv = entry(ResourceType::Srv, 4);
+        assert!(super::copies_table(&srv, &[]));
+        assert!(super::copies_table(&srv, &[1, 5]));
+        assert!(!super::copies_table(&srv, &[3]));
+        assert!(!super::copies_table(&entry(ResourceType::Srv, 8), &[]));
+        assert!(!super::copies_table(&entry(ResourceType::Uav, 4), &[]));
+        assert!(!super::copies_table(&entry(ResourceType::Cbv, 4), &[]));
+    }
 
     /// A root shader view is a raw view from its address to the end of its
     /// buffer's host copy, read through a table of the shape pipelines get:

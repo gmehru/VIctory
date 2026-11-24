@@ -603,6 +603,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         stride_table: false,
+        per_lane_tables: Vec::new(),
     }
 }
 
@@ -1608,6 +1609,7 @@ void main() {
             root_cbvs: Vec::new(),
             root_srvs: vec![4],
             stride_table: false,
+            per_lane_tables: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // The user data, then the root SRV's table.

@@ -83,6 +83,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         stride_table: lowered.stride_table,
+        per_lane_tables: super::per_lane_tables(&native, &p, &res),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -165,6 +166,8 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;
     let shader = build(WATERFALL_JOINED_WAVE32, false);
+    // Two whole descriptors, joined: no index.
+    assert!(shader.per_lane_tables.is_empty());
     for (label, red) in sampled(&shader) {
         // Lanes below 16 took the first texture, the others the second.
         let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
@@ -176,6 +179,8 @@ fn lanes_sample_the_texture_their_if_else_arm_chose() {
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
     let shader = build(WATERFALL_JOINED_MIXED_WAVE32, false);
+    // Global loads at each lane's offset in the table at s0.
+    assert_eq!(shader.per_lane_tables, [0]);
     for (label, red) in sampled(&shader) {
         // Lanes below 16 loaded entry (lane & 1); of the others, lanes
         // below 24 picked the first, the rest the second.
@@ -225,6 +230,8 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
 fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
     let shader = build(WATERFALL_INDEXED_WAVE32, false);
+    // The loop's load at the first lane's offset in the table at s0.
+    assert_eq!(shader.per_lane_tables, [0]);
     let results = sampled(&shader);
     assert!(!results.is_empty());
     for (label, red) in results {
@@ -241,6 +248,8 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for folded in [false, true] {
         let shader = build(&cmpx_waterfall(false, folded), false);
+        // Two descriptors loaded whole, picked per lane: no index.
+        assert!(shader.per_lane_tables.is_empty());
         let results = sampled(&shader);
         assert!(!results.is_empty());
         for (label, red) in results {
