@@ -168,6 +168,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         listing
                                             .extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                         listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                                        // What the hardware loads on entry
+                                        // (the register layout's source).
+                                        listing.push(format!("    {:?}", n.io));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );

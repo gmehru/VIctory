@@ -319,6 +319,17 @@ impl ComputeIo {
         (ids, take(10))
     }
 
+    /// The SGPRs the hardware loads (s0 up to this): the user SGPRs, the
+    /// enabled group id components and group info, then the wave's scratch
+    /// offset when scratch is enabled (bit 0), last in GFX10's order.
+    pub fn loaded_sgprs(&self) -> u8 {
+        let system = [0, 7, 8, 9, 10]
+            .iter()
+            .filter(|&&bit| self.rsrc2 >> bit & 1 != 0)
+            .count();
+        self.user_sgprs() + system as u8
+    }
+
     /// Thread id components in v0, v1, v2 (1 to 3).
     pub fn thread_id_vgprs(&self) -> u8 {
         (self.rsrc2 >> 11 & 3) as u8 + 1
@@ -946,6 +957,27 @@ mod tests {
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+    }
+
+    #[test]
+    fn loaded_sgprs_end_after_the_scratch_offset() {
+        let cs = |rsrc2| ComputeIo {
+            rsrc2,
+            threads: [64, 1, 1],
+        };
+        // 8 user SGPRs, group id x (s8).
+        assert_eq!(cs(0x90).loaded_sgprs(), 9);
+        // 5 user SGPRs, group ids x and y.
+        assert_eq!(cs(0x1098A).loaded_sgprs(), 7);
+        // 2 user SGPRs, all group ids, group info, scratch (its offset in s6).
+        let all = 2 << 1 | 1 | 0xF << 7;
+        assert_eq!(
+            cs(all).system_sgprs(),
+            ([Some(2), Some(3), Some(4)], Some(5))
+        );
+        assert_eq!(cs(all).loaded_sgprs(), 7);
+        // A trap handler (bit 6) loads none.
+        assert_eq!(cs(2 << 1 | 1 << 6).loaded_sgprs(), 2);
     }
 
     #[test]

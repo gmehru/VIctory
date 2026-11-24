@@ -767,8 +767,10 @@ fn data_dwords(name: &str) -> u8 {
     n
 }
 
-/// Address dwords of an image opcode: offset, bias, compare, derivatives,
-/// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
+/// Address dwords of an image opcode: offset, bias, compare (a dword each),
+/// derivatives (16-bit in the `_g16` opcodes only, one dword per pair of a
+/// direction, an odd one alone), then coordinates and LOD/clamp/mip, packed
+/// in pairs with `a16` (LLVM's GFX10 image operand rules).
 fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
@@ -805,9 +807,10 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    let derivs = if name.ends_with("_g16") {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
-    }
+        2 * derivs
+    };
+    whole + derivs + if a16 { packed.div_ceil(2) } else { packed }
 }

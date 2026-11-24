@@ -21,6 +21,7 @@
 //!
 //! Compute programs get the thread id in the group in v0-v2 and the group
 //! id in the SGPRs after the user data, as `COMPUTE_PGM_RSRC2` enables them.
+//! The SGPRs after those hold what an earlier wave left there.
 //!
 //! Mesh programs run as one NGG stage. The program computes its thread
 //! index from the wave index (s3 bits 24-27) and the lane (`v_mbcnt`), and
@@ -33,7 +34,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{Inst, Program, Reg, VCC, Value};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
 use crate::resource::Site;
 
@@ -70,6 +71,10 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Compute: an SGPR past those the hardware loads, read only as the
+    /// argument of phis that other paths write: it holds whatever an
+    /// earlier wave left there, so any value is the program's.
+    Undefined,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +237,20 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 }
             }
             loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
+            // The compiler reads an SGPR the hardware leaves alone only
+            // where a path that never wrote it joins one that did (LLVM's
+            // undef in a phi). One read directly may be a register the
+            // hardware does load that `system_sgprs` does not name, and
+            // stays refused.
+            let past = cs.loaded_sgprs();
+            for &(reg, v) in &p.inputs {
+                if let Reg::S(s) = reg
+                    && (past..VCC).contains(&s)
+                    && only_joined(p, v)
+                {
+                    loaded.push((reg, Input::Undefined));
+                }
+            }
             (loaded, &[][..], &[][..])
         }
         (StageIo::Ms(ms), HwStage::Ms) => {
@@ -430,6 +449,52 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
         next += count;
     }
     out
+}
+
+/// Whether `v` is read only where it joins a value some path gives the
+/// register: no instruction reads it, nor a phi of nothing but it.
+fn only_joined(p: &Program, v: Value) -> bool {
+    let phis: Vec<&crate::ir::Phi> = p.blocks.iter().flat_map(|b| &b.phis).collect();
+    // The phis `v` flows into, through other phis.
+    let mut same = vec![v];
+    loop {
+        let more: Vec<Value> = phis
+            .iter()
+            .filter(|phi| !same.contains(&phi.value) && phi.args.iter().any(|a| same.contains(a)))
+            .map(|phi| phi.value)
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        same.extend(more);
+    }
+    // Of those, the ones that hold nothing but `v` (loops of them too):
+    // drop each that takes a value from elsewhere until none is left.
+    loop {
+        let kept: Vec<Value> = same
+            .iter()
+            .copied()
+            .filter(|&x| {
+                x == v
+                    || phis
+                        .iter()
+                        .any(|phi| phi.value == x && phi.args.iter().all(|a| same.contains(a)))
+            })
+            .collect();
+        if kept.len() == same.len() {
+            break;
+        }
+        same = kept;
+    }
+    let read = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .any(|i| i.reads.iter().any(|r| same.contains(&r.1)));
+    let joined = phis
+        .iter()
+        .any(|phi| !same.contains(&phi.value) && phi.args.iter().any(|a| same.contains(a)));
+    !read && joined
 }
 
 /// An interpolation before its attribute is known.

@@ -1,14 +1,17 @@
-//! Hand-assembled GFX10 compute programs through the whole translator:
+//! Hand-assembled GFX10 compute programs (and a few pixel programs, drawn
+//! after a vertex shader of constants) through the whole translator:
 //! validated by `dxil.dll` when there is one, and run on the host devices
 //! (hardware and WARP) against results worked out from the instruction
 //! set, for what the differential tests cannot reach without the console
 //! compiler: spilled SGPRs, descriptor loads read as numbers, derivatives.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::container::SigElement;
+use super::host::{Dispatch, Draw, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::dxbc::{Container, FourCC};
 use crate::native::{
-    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+    ComputeIo, HwStage, NativeProgram, PsInput, ResourceType, RootParam, RootType, StageIo, Usage,
+    UsedResource,
 };
 use crate::{ShaderError, io, ir, resource, structure};
 
@@ -1125,4 +1128,1510 @@ fn a_descriptor_copied_in_some_lanes_only_is_not_every_lanes() {
     run_held(&shader, 0, |label, out| {
         assert_eq!(out[..8], [WRAP; 8], "{label}");
     });
+}
+
+// ---- sampling forms: gathers at a level, a16 biases, clamped gradients ----
+
+const IMAGE_SAMPLE_D: u32 = 0x22;
+const IMAGE_SAMPLE_D_CL: u32 = 0x23;
+const IMAGE_SAMPLE_B: u32 = 0x25;
+const IMAGE_GATHER4_L: u32 = 0x44;
+const IMAGE_GATHER4_L_O: u32 = 0x54;
+const IMAGE_GATHER4_LZ_O: u32 = 0x57;
+const V_ADD_F32: u32 = 0x03;
+const V_MUL_F32: u32 = 0x08;
+const V_CVT_F32_I32: u32 = 0x05;
+const V_CVT_PKRTZ_F16_F32: u32 = 0x2F;
+const V3_CVT_F32_I32: u32 = 0x185;
+/// SOPP `s_cbranch_scc1`, the dwords to skip in the low half.
+const S_CBRANCH_SCC1: u32 = 0xBF85_0000;
+const DIM_2D: u32 = 1;
+const DIM_CUBE: u32 = 3;
+const DIM_2D_ARRAY: u32 = 5;
+
+/// MIMG `op vdata, v[vaddr..], s[rsrc..], s[sampler..]` of dimension `dim`
+/// with `dmask`, 32-bit addresses or (`a16`) 16-bit ones.
+#[allow(clippy::too_many_arguments)]
+const fn mimg(
+    op: u32,
+    vdata: u8,
+    vaddr: u8,
+    rsrc: u8,
+    sampler: u8,
+    dmask: u32,
+    dim: u32,
+    a16: bool,
+) -> [u32; 2] {
+    [
+        0xF000_0000 | op << 18 | dmask << 8 | dim << 3,
+        (a16 as u32) << 30
+            | ((sampler as u32) >> 2) << 21
+            | ((rsrc as u32) >> 2) << 16
+            | (vdata as u32) << 8
+            | vaddr as u32,
+    ]
+}
+
+/// MUBUF `buffer_load_dword vdata, vaddr, s[rsrc..], 0 offen offset:offset`.
+const fn buffer_load_dword(vdata: u8, vaddr: u8, rsrc: u8, offset: u32) -> [u32; 2] {
+    [
+        0xE030_1000 | offset,
+        0x80 << 24 | ((rsrc as u32) >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// A 4×4 texture with levels of 2×2 and 1×1: red 1 + 10y + x at level 0,
+/// 100 + 10y + x at level 1, 200 at level 2; green 1000 more; alpha 1.
+fn level_texels() -> Vec<[f32; 4]> {
+    let mut t = Vec::new();
+    for (size, base) in [(4, 1.0), (2, 100.0), (1, 200.0)] {
+        for y in 0..size {
+            for x in 0..size {
+                let r = base + 10.0 * y as f32 + x as f32;
+                t.push([r, r + 1000.0, 0.0, 1.0]);
+            }
+        }
+    }
+    t
+}
+
+/// Immediate sampler words: x border (transparent black), y clamped,
+/// trilinear, LOD 0 to 13, word 2's bit 28 set as the console sets it.
+const GATHER_SAMPLER: [u32; 4] = [0x16, 0x00D0_0000, 0x1850_0000, 0];
+
+/// A compute program of 8 threads. Each reads (offset dword, u, v, level
+/// as an integer) from the buffer at 16 × thread into v4-v7, runs `lod` (on
+/// v7), and stores at 64 × thread: `image_gather4_l_o` of red and of green
+/// with the immediate sampler `sampler` in s[24:27] (or, with `heap`, the
+/// heap's at s[28:31]), `image_gather4_lz_o` of red with the heap's (point,
+/// clamped), `image_gather4_l` of red without the offsets.
+fn gathers(sampler: [u32; 4], lod: &[u32], heap: bool) -> NativeProgram {
+    gathers_as((1, DIM_2D, false), sampler, lod, heap)
+}
+
+/// [`gathers`] with its first gather's channels, dimension and 16-bit
+/// addressing `(dmask, dim, a16)` changed.
+fn gathers_as(form: (u32, u32, bool), sampler: [u32; 4], lod: &[u32], heap: bool) -> NativeProgram {
+    let (dmask, dim, a16) = form;
+    let mut w = vec![s_mov_b32(4, 1), s_mov_b32(5, k(0)), s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(3, 12, 0, 0x20));
+    w.extend(s_load(2, 20, 0, 0x40));
+    w.extend(s_load(2, 28, 4, 0));
+    for (d, &word) in sampler.iter().enumerate() {
+        w.extend([s_mov_b32(24 + d as u8, LIT), word]);
+    }
+    let at = if heap { 28 } else { 24 };
+    w.push(vop2(V_LSHLREV_B32, 1, k(4), 0));
+    for d in 0..4u8 {
+        w.extend(buffer_load_dword(4 + d, 1, 20, 4 * u32::from(d)));
+    }
+    w.extend_from_slice(lod);
+    w.extend(mimg(IMAGE_GATHER4_L_O, 8, 4, 12, at, dmask, dim, a16));
+    w.extend(mimg(IMAGE_GATHER4_L_O, 12, 4, 12, at, 2, DIM_2D, false));
+    w.extend(mimg(IMAGE_GATHER4_LZ_O, 16, 4, 12, 28, 1, DIM_2D, false));
+    w.extend(mimg(IMAGE_GATHER4_L, 20, 5, 12, at, 1, DIM_2D, false));
+    w.push(vop2(V_LSHLREV_B32, 2, k(6), 0));
+    for r in 0..16u8 {
+        w.extend(buffer_store_dword(8 + r, 2, 8, 4 * u32::from(r)));
+    }
+    w.push(S_ENDPGM);
+    program(
+        &w,
+        false,
+        [8, 1, 1],
+        vec![table(0, 0), table(1, 1)],
+        vec![
+            used(ResourceType::Uav, 0, 4, 0),
+            used(ResourceType::Srv, 8, 8, 0),
+            used(ResourceType::Srv, 16, 4, 0),
+            used(ResourceType::Sampler, 0, 4, 1),
+        ],
+    )
+}
+
+/// Per thread: offset dword, u, v, level of detail.
+const GATHER_CASES: [(u32, f32, f32, i32); 8] = [
+    (0, 0.375, 0.625, 0),
+    (0, 0.25, 0.75, 1),
+    (0, 0.0, 0.125, 0),
+    (0, 0.5, 0.5, 7),
+    // x + 1, y - 1.
+    (0x3F01, 0.375, 0.375, 0),
+    // 0.375 less an ulp: a texel centre through a reciprocal, say.
+    (0, f32::from_bits(0x3EBF_FFFF), 0.625, 0),
+    (0, 0.625, 0.375, -3),
+    (0x0001, 0.75, 0.25, 1),
+];
+
+/// Runs a [`gathers`] program over [`level_texels`] with [`GATHER_CASES`]
+/// and hands each thread's 16 results (as floats) to `check`.
+fn run_gathers(shader: &HostShader, check: impl Fn(&str, usize, &[f32])) {
+    let params: Vec<u32> = GATHER_CASES
+        .iter()
+        .flat_map(|&(o, u, v, l)| [o, u.to_bits(), v.to_bits(), l as u32])
+        .collect();
+    let texels = level_texels();
+    let views = [
+        View::RawUav(8 * 16),
+        View::Levels(4, 4, 3, &texels),
+        View::Buffer {
+            data: &params,
+            stride: super::host::Stride::Raw,
+        },
+    ];
+    run(shader, &views, 0, |label, out| {
+        for t in 0..8 {
+            let got: Vec<f32> = out[16 * t..16 * (t + 1)]
+                .iter()
+                .map(|&x| f32::from_bits(x))
+                .collect();
+            check(label, t, &got);
+        }
+    });
+}
+
+/// `image_gather4_l(_o)` at a whole level of detail: the footprint at the
+/// level picked (clamped to the sampler's bounds and the view's last
+/// level), border texels 0 in x, clamped ones in y, offsets in texels of
+/// that level, in the order (0, 1), (1, 1), (1, 0), (0, 0); green 1000
+/// more where inside. At level 0 the host's own gather (clamped) agrees.
+/// The level of detail is converted from the integer, or (as the meshlet
+/// culling passes choose theirs) joined from the two sides of a uniform
+/// branch, each whole: lane 0's integer is 0, so the side without the
+/// added 1 runs.
+#[test]
+fn a_gather_at_a_level_reads_that_levels_footprint() {
+    let _serial = serial();
+    let cvt = vop1(V_CVT_F32_I32, 7, vgpr(7));
+    let joined = [
+        vop1(V_READFIRSTLANE_B32, 40, vgpr(7)),
+        s_cmp_eq_u32(40, k(0)),
+        cvt,
+        S_CBRANCH_SCC1 | 1,
+        vop2(V_ADD_F32, 7, 242, 7),
+    ];
+    for lod in [&[cvt][..], &joined] {
+        let shader = translate(&gathers(GATHER_SAMPLER, lod, false)).unwrap();
+        check_gathers(&shader, GATHER_LEVEL, GATHER_PLAIN);
+    }
+}
+
+/// Red of [`GATHER_CASES`] at the level with the offsets, with
+/// [`GATHER_SAMPLER`].
+const GATHER_LEVEL: [[f32; 4]; 8] = [
+    [32., 33., 23., 22.],
+    [110., 111., 111., 110.],
+    [0., 11., 1., 0.],
+    [200., 0., 0., 200.],
+    [13., 14., 4., 3.],
+    [32., 33., 23., 22.],
+    [23., 24., 14., 13.],
+    [0., 0., 0., 0.],
+];
+
+/// Red of [`GATHER_CASES`] at the level without the offsets, with
+/// [`GATHER_SAMPLER`].
+const GATHER_PLAIN: [[f32; 4]; 8] = [
+    [32., 33., 23., 22.],
+    [110., 111., 111., 110.],
+    [0., 11., 1., 0.],
+    [200., 0., 0., 200.],
+    [22., 23., 13., 12.],
+    [32., 33., 23., 22.],
+    [23., 24., 14., 13.],
+    [111., 0., 0., 101.],
+];
+
+/// Runs a [`gathers`] program and checks red at the level with the offsets
+/// (`level`), green (1000 more where inside), red without the offsets
+/// (`plain`) and the host's own level-0 gather (of the heap's sampler).
+fn check_gathers(shader: &HostShader, level: [[f32; 4]; 8], plain: [[f32; 4]; 8]) {
+    // The host's level-0 gather (clamped); none for the ulp case, where
+    // hosts may round otherwise.
+    let level0: [Option<[f32; 4]>; 8] = [
+        Some([32., 33., 23., 22.]),
+        Some([31., 32., 22., 21.]),
+        Some([11., 11., 1., 1.]),
+        Some([22., 23., 13., 12.]),
+        Some([13., 14., 4., 3.]),
+        None,
+        Some([23., 24., 14., 13.]),
+        Some([14., 14., 4., 4.]),
+    ];
+    run_gathers(shader, |label, t, got| {
+        let red = level[t];
+        let green = red.map(|r| if r == 0.0 { 0.0 } else { r + 1000.0 });
+        assert_eq!(got[..4], red, "{label}, thread {t}: red");
+        assert_eq!(got[4..8], green, "{label}, thread {t}: green");
+        if let Some(level0) = level0[t] {
+            assert_eq!(got[8..12], level0, "{label}, thread {t}: host gather");
+        }
+        assert_eq!(got[12..], plain[t], "{label}, thread {t}: without offsets");
+    });
+}
+
+/// The sampler's bounds on the level of detail (4.8 fixed point, word 1):
+/// a MAX_LOD of 1 keeps level of detail 7 at level 1; a MIN_LOD of 1 lifts
+/// 0 and -3 to level 1 (1 and 7 stay at 1 and the last level, 2).
+#[test]
+fn a_gather_at_a_level_keeps_to_the_samplers_bounds() {
+    let _serial = serial();
+    let cvt = vop1(V_CVT_F32_I32, 7, vgpr(7));
+    // Level 1's whole texture: (0, 1), (1, 1), (1, 0), (0, 0).
+    let quad = [110., 111., 101., 100.];
+    let at_most_1 = {
+        let (mut level, mut plain) = (GATHER_LEVEL, GATHER_PLAIN);
+        level[3] = quad;
+        plain[3] = quad;
+        (level, plain)
+    };
+    let at_least_1 = (
+        [
+            quad,
+            [110., 111., 111., 110.],
+            [0., 100., 100., 0.],
+            [200., 0., 0., 200.],
+            [101., 0., 0., 101.],
+            quad,
+            quad,
+            [0., 0., 0., 0.],
+        ],
+        [
+            quad,
+            [110., 111., 111., 110.],
+            [0., 100., 100., 0.],
+            [200., 0., 0., 200.],
+            quad,
+            quad,
+            quad,
+            [111., 0., 0., 101.],
+        ],
+    );
+    for (bounds, (level, plain)) in [(0x0010_0000, at_most_1), (0x00D0_0100, at_least_1)] {
+        let mut sampler = GATHER_SAMPLER;
+        sampler[1] = bounds;
+        let shader = translate(&gathers(sampler, &[cvt], false)).unwrap();
+        check_gathers(&shader, level, plain);
+    }
+}
+
+/// Without a mip filter the base level is read, whatever the level of
+/// detail (here the integer's bits, not a whole float).
+#[test]
+fn a_gather_without_a_mip_filter_reads_the_base_level() {
+    let _serial = serial();
+    let mut sampler = GATHER_SAMPLER;
+    sampler[2] = 0x1050_0000;
+    let shader = translate(&gathers(sampler, &[], false)).unwrap();
+    let want: [[f32; 4]; 8] = [
+        [32., 33., 23., 22.],
+        [31., 32., 22., 21.],
+        [0., 11., 1., 0.],
+        [22., 23., 13., 12.],
+        [13., 14., 4., 3.],
+        [32., 33., 23., 22.],
+        [23., 24., 14., 13.],
+        [14., 0., 0., 4.],
+    ];
+    run_gathers(&shader, |label, t, got| {
+        assert_eq!(got[..4], want[t], "{label}, thread {t}");
+    });
+}
+
+/// What a gather at a level cannot do exactly stays refused: a level of
+/// detail that may be fractional (loaded, halved by a multiply or by the
+/// output modifier, whole only in the lanes a guard lets through or on one
+/// side of a branch) or sampler bounds that may be; wrapped addressing,
+/// state a gather does not ignore (a LOD bias, unnormalized or truncated
+/// coordinates), a border other than 0 in the channel gathered (opaque
+/// white; opaque black's alpha), a sampler from the heap (its state unknown
+/// here); an array, or 16-bit coordinates.
+#[test]
+fn gathers_at_a_level_that_may_differ_are_refused() {
+    let _serial = serial();
+    let cvt = vop1(V_CVT_F32_I32, 7, vgpr(7));
+    let not_whole = "a gather at a level of detail that may not be whole";
+    assert_eq!(refusal(&gathers(GATHER_SAMPLER, &[], false)), not_whole);
+    let halved = [cvt, vop2(V_MUL_F32, 7, 240, 7)];
+    assert_eq!(refusal(&gathers(GATHER_SAMPLER, &halved, false)), not_whole);
+    // omod 3: the result halved.
+    let mut cvt_halved = vop3(V3_CVT_F32_I32, 7, vgpr(7), 0, 0);
+    cvt_halved[1] |= 3 << 27;
+    assert_eq!(
+        refusal(&gathers(GATHER_SAMPLER, &cvt_halved, false)),
+        not_whole
+    );
+    // Converted where lane 0's integer is not 0; loaded as it is where it is.
+    let one_side = [
+        vop1(V_READFIRSTLANE_B32, 40, vgpr(7)),
+        s_cmp_eq_u32(40, k(0)),
+        S_CBRANCH_SCC1 | 1,
+        cvt,
+    ];
+    assert_eq!(
+        refusal(&gathers(GATHER_SAMPLER, &one_side, false)),
+        not_whole
+    );
+    let odd_lanes = [
+        vop2(V_AND_B32, 3, k(1), 0),
+        vopc(V_CMP_EQ_U32, k(1), 3),
+        s_mov_b32(40, EXEC_LO),
+        sop2(S_AND_B32, 126, EXEC_LO, VCC_LO),
+        cvt,
+        s_mov_b32(126, 40),
+    ];
+    assert_eq!(
+        refusal(&gathers(GATHER_SAMPLER, &odd_lanes, false)),
+        not_whole
+    );
+    let with = |word: usize, value: u32| {
+        let mut s = GATHER_SAMPLER;
+        s[word] = value;
+        refusal(&gathers(s, &[cvt], false))
+    };
+    // MIN_LOD 0.5, MAX_LOD 12.5.
+    assert_eq!(with(1, 0x00D0_0080), not_whole);
+    assert_eq!(with(1, 0x00C8_0000), not_whole);
+    assert_eq!(
+        with(0, 0x10),
+        "a gather at a level with wrapped or mirrored addressing"
+    );
+    let ignored = "a gather at a level with sampler state it does not ignore";
+    assert_eq!(with(2, 0x1850_0100), ignored);
+    // FORCE_UNNORMALIZED, TRUNC_COORD.
+    assert_eq!(with(0, 0x16 | 1 << 15), ignored);
+    assert_eq!(with(0, 0x16 | 1 << 27), ignored);
+    let border = "a gather at a level with a border colour other than 0";
+    assert_eq!(with(3, 0x8000_0000), border);
+    // Opaque black: 0 in red and green, 1 in alpha.
+    let mut opaque_black = GATHER_SAMPLER;
+    opaque_black[3] = 0x4000_0000;
+    assert!(translate(&gathers(opaque_black, &[cvt], false)).is_ok());
+    assert_eq!(
+        refusal(&gathers_as((8, DIM_2D, false), opaque_black, &[cvt], false)),
+        border
+    );
+    assert_eq!(
+        refusal(&gathers(GATHER_SAMPLER, &[cvt], true)),
+        "a gather at a level with a sampler from memory"
+    );
+    let other = "a gather at a level of other than 2D normalized coordinates";
+    for form in [(1, DIM_2D_ARRAY, false), (1, DIM_2D, true)] {
+        assert_eq!(
+            refusal(&gathers_as(form, GATHER_SAMPLER, &[cvt], false)),
+            other,
+            "{form:?}"
+        );
+    }
+}
+
+/// `image_sample_b` with a16: the bias is an f16 in the low half of its
+/// own dword (the high half, 2.0 here, unused), then u and v as f16 in the
+/// next. In a quad stepping a texel per thread (level of detail 0), a bias
+/// of +1 reads level 1, -1 level 0.
+#[test]
+fn a_biased_sample_of_16_bit_coordinates() {
+    let _serial = serial();
+    let quarter = 0.25f32.to_bits();
+    let mut w = vec![s_mov_b32(4, 1), s_mov_b32(5, k(0)), s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(3, 12, 0, 0x20));
+    w.extend(s_load(2, 28, 4, 0));
+    // (x + 0.5) / 4 and (y + 0.5) / 4 as f16 in v5, u low.
+    for (r, id) in [(2u8, 0u8), (3, 1)] {
+        w.push(vop1(V_CVT_F32_U32, r, vgpr(id)));
+        w.push(vop2(V_ADD_F32, r, 240, r));
+        w.extend([vop2(V_MUL_F32, r, LIT, r), quarter]);
+    }
+    w.push(vop2(V_CVT_PKRTZ_F16_F32, 5, vgpr(2), 3));
+    for (r, bias) in [(6u8, 0x4000_3C00u32), (7, 0x4000_BC00)] {
+        w.extend([vop1(V_MOV_B32, 4, LIT), bias]);
+        w.extend(mimg(IMAGE_SAMPLE_B, r, 4, 12, 28, 1, DIM_2D, true));
+    }
+    // Thread x + 2y stores at 8 × that.
+    w.push(vop2(V_LSHLREV_B32, 8, k(1), 1));
+    w.push(vop2(V_ADD_NC_U32, 8, vgpr(0), 8));
+    w.push(vop2(V_LSHLREV_B32, 8, k(3), 8));
+    w.extend(buffer_store_dword(6, 8, 8, 0));
+    w.extend(buffer_store_dword(7, 8, 8, 4));
+    w.push(S_ENDPGM);
+    let native = program(
+        &w,
+        false,
+        [2, 2, 1],
+        vec![table(0, 0), table(1, 1)],
+        vec![
+            used(ResourceType::Uav, 0, 4, 0),
+            used(ResourceType::Srv, 8, 8, 0),
+            used(ResourceType::Sampler, 0, 4, 1),
+        ],
+    );
+    let shader = translate(&native).unwrap();
+    let texels = level_texels();
+    let views = [View::RawUav(8), View::Levels(4, 4, 3, &texels)];
+    run(&shader, &views, 0, |label, out| {
+        for t in 0..4 {
+            let (x, y) = (t % 2, t / 2);
+            let got = [f32::from_bits(out[2 * t]), f32::from_bits(out[2 * t + 1])];
+            let level0 = 1.0 + 10.0 * y as f32 + x as f32;
+            assert_eq!(got, [100.0, level0], "{label}, thread {t}");
+        }
+    });
+}
+
+/// The program of [`a_gradient_sample_clamps_its_level`]: 4 threads, a
+/// texel per thread in x at level 0 (derivatives in v10-v13), s = (x +
+/// 0.5) / 4 and t = 0.125 in v14-v15, the clamp in v16; `image_sample_d_cl`
+/// with clamps 0, 1 and 2, then `image_sample_d`, stored at 16 × thread.
+fn clamped_gradients(dim: u32, a16: bool) -> NativeProgram {
+    let quarter = 0.25f32.to_bits();
+    let mut w = vec![s_mov_b32(4, 1), s_mov_b32(5, k(0)), s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(3, 12, 0, 0x20));
+    w.extend(s_load(2, 28, 4, 0));
+    w.extend([vop1(V_MOV_B32, 10, LIT), quarter]);
+    w.push(vop1(V_MOV_B32, 11, k(0)));
+    w.push(vop1(V_MOV_B32, 12, k(0)));
+    w.extend([vop1(V_MOV_B32, 13, LIT), quarter]);
+    w.push(vop1(V_CVT_F32_U32, 14, vgpr(0)));
+    w.push(vop2(V_ADD_F32, 14, 240, 14));
+    w.extend([vop2(V_MUL_F32, 14, LIT, 14), quarter]);
+    w.extend([vop1(V_MOV_B32, 15, LIT), 0.125f32.to_bits()]);
+    w.push(vop1(V_MOV_B32, 17, k(0)));
+    for (r, clamp) in [(20u8, 0.0f32), (21, 1.0), (22, 2.0)] {
+        w.extend([vop1(V_MOV_B32, 16, LIT), clamp.to_bits()]);
+        w.extend(mimg(IMAGE_SAMPLE_D_CL, r, 10, 12, 28, 1, dim, a16));
+    }
+    w.extend(mimg(IMAGE_SAMPLE_D, 23, 10, 12, 28, 1, dim, a16));
+    w.push(vop2(V_LSHLREV_B32, 8, k(4), 0));
+    for r in 0..4u8 {
+        w.extend(buffer_store_dword(20 + r, 8, 8, 4 * u32::from(r)));
+    }
+    w.push(S_ENDPGM);
+    program(
+        &w,
+        false,
+        [4, 1, 1],
+        vec![table(0, 0), table(1, 1)],
+        vec![
+            used(ResourceType::Uav, 0, 4, 0),
+            used(ResourceType::Srv, 8, 8, 0),
+            used(ResourceType::Sampler, 0, 4, 1),
+        ],
+    )
+}
+
+/// `image_sample_d_cl`: derivatives, coordinates, then the least level of
+/// detail. Level 0 by the derivatives; clamped to 1 and 2 it reads those
+/// levels (level 1's texel floor(2s)).
+#[test]
+fn a_gradient_sample_clamps_its_level() {
+    let _serial = serial();
+    let shader = translate(&clamped_gradients(DIM_2D, false)).unwrap();
+    let texels = level_texels();
+    let views = [View::RawUav(16), View::Levels(4, 4, 3, &texels)];
+    run(&shader, &views, 0, |label, out| {
+        for x in 0..4 {
+            let got: Vec<f32> = out[4 * x..4 * x + 4]
+                .iter()
+                .map(|&v| f32::from_bits(v))
+                .collect();
+            let level0 = 1.0 + x as f32;
+            let level1 = 100.0 + (x / 2) as f32;
+            assert_eq!(got, [level0, level1, 200.0, level0], "{label}, thread {x}");
+        }
+    });
+}
+
+/// Gradients of a cube are the face's, which the host would project from
+/// 3D ones in its own way; 16-bit coordinates with gradients have no
+/// program to check them against. Both stay refused.
+#[test]
+fn gradient_samples_that_cannot_be_checked_are_refused() {
+    let _serial = serial();
+    assert_eq!(
+        refusal(&clamped_gradients(DIM_CUBE, false)),
+        "a cube sample with texel coordinates, gradients or a level query"
+    );
+    assert_eq!(
+        refusal(&clamped_gradients(DIM_2D, true)),
+        "a sample with gradients and 16-bit coordinates"
+    );
+}
+
+/// The f16 bits of `x`, a normal f16 value exactly.
+fn f16_bits(x: f32) -> u32 {
+    let b = x.to_bits();
+    let exp = (b >> 23 & 0xFF) as i32 - 127 + 15;
+    assert!((1..31).contains(&exp) && b & 0x1FFF == 0, "{x} is no f16");
+    (b >> 31) << 15 | (exp as u32) << 10 | (b & 0x7F_FFFF) >> 13
+}
+
+/// VOP3P `op vdst, src0, src1, src2` with f32 sources (op_sel_hi clear).
+const fn vop3p(op: u32, dst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    [
+        0xCC00_0000 | op << 16 | dst as u32,
+        src0 as u32 | (src1 as u32) << 9 | (src2 as u32) << 18,
+    ]
+}
+
+/// SOPP `s_cbranch_scc1` and `s_branch` over `n` dwords.
+const fn s_cbranch_scc1(n: u32) -> u32 {
+    0xBF85_0000 | n
+}
+
+const fn s_branch(n: u32) -> u32 {
+    0xBF82_0000 | n
+}
+
+const fn s_cmp_lg_u32(src0: u16, src1: u16) -> u32 {
+    0xBF07_0000 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// The second dword of an SDWA VOP1 or VOP2: `src0` a VGPR read as `sel`
+/// (4 its low word, 5 its high word), the whole dword written.
+const fn sdwa_src0(src0: u8, sel: u32) -> u32 {
+    src0 as u32 | 6 << 8 | sel << 16
+}
+
+const SDWA: u16 = 0xF9;
+const V_CVT_F32_F16: u32 = 0x0B;
+const V_FMA_MIXLO_F16: u32 = 0x21;
+const INLINE_HALF: u16 = 240;
+const INLINE_TWO: u16 = 244;
+
+/// Root constants at user data 2 (s2), after the UAV table's s0.
+fn constant_at_s2() -> RootParam {
+    RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 2,
+        slot: 1,
+    }
+}
+
+/// `sgpr`, written only where the root constant is not 0 and read only
+/// there: 41 then, else 7, stored at 4 × thread. Three user SGPRs, and
+/// what `rsrc2` adds to the registers the hardware loads.
+fn joined_sgpr(sgpr: u8, rsrc2: u32) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.push(s_cmp_eq_u32(2, k(0)));
+    w.push(s_cbranch_scc1(1));
+    w.push(s_mov_b32(sgpr, k(41)));
+    w.push(vop1(V_MOV_B32, 3, k(7)));
+    w.push(s_cmp_eq_u32(2, k(0)));
+    w.push(s_cbranch_scc1(1));
+    w.push(vop1(V_MOV_B32, 3, u16::from(sgpr)));
+    w.push(vop2(V_LSHLREV_B32, 5, k(2), 0));
+    w.extend(buffer_store_dword(3, 5, 8, 0));
+    w.push(S_ENDPGM);
+    let mut native = program(
+        &w,
+        false,
+        [4, 1, 1],
+        vec![table(0, 0), constant_at_s2()],
+        vec![used(ResourceType::Uav, 0, 4, 0)],
+    );
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= rsrc2;
+    }
+    native
+}
+
+/// An SGPR the hardware leaves alone (s20: three user SGPRs, nothing
+/// else) is read only where the path that wrote it joins one that did
+/// not: the program sees the written value.
+#[test]
+fn an_sgpr_the_hardware_leaves_alone_joins_a_written_one() {
+    let _serial = serial();
+    let shader = translate(&joined_sgpr(20, 0)).unwrap();
+    for constant in [0, 1] {
+        run(&shader, &[View::RawUav(4)], constant, |label, out| {
+            let want = if constant == 0 { 7 } else { 41 };
+            assert_eq!(out, [want; 4], "{label}, {constant}");
+        });
+    }
+}
+
+/// Read directly, the register may be one the hardware loads; and the one
+/// after the user SGPRs is, with scratch enabled (its offset, s3 here).
+#[test]
+fn hardware_sgprs_read_otherwise_stay_refused() {
+    let _serial = serial();
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.push(vop1(V_MOV_B32, 3, 20));
+    w.push(vop2(V_LSHLREV_B32, 5, k(2), 0));
+    w.extend(buffer_store_dword(3, 5, 8, 0));
+    w.push(S_ENDPGM);
+    let direct = program(
+        &w,
+        false,
+        [4, 1, 1],
+        vec![table(0, 0), constant_at_s2()],
+        vec![used(ResourceType::Uav, 0, 4, 0)],
+    );
+    assert_eq!(refusal(&direct), "a hardware SGPR input");
+    assert_eq!(refusal(&joined_sgpr(3, 1)), "a hardware SGPR input");
+    // Past it, the join is the program's again.
+    translate(&joined_sgpr(4, 1)).unwrap();
+}
+
+/// A compute program of 4 threads: v1 the thread-group info (which no
+/// translation has), its low half then f16(2t + 0.5) by
+/// `v_fma_mixlo_f16`, which keeps the high half; `read` then reads v1
+/// into v4-v7, stored at 16 × thread.
+fn kept_half(read: &[u32]) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.push(vop1(V_MOV_B32, 1, 3));
+    w.push(vop1(V_CVT_F32_U32, 2, vgpr(0)));
+    w.extend(vop3p(V_FMA_MIXLO_F16, 1, vgpr(2), INLINE_TWO, INLINE_HALF));
+    w.extend(read);
+    w.push(vop2(V_LSHLREV_B32, 9, k(4), 0));
+    for r in 0..4u8 {
+        w.extend(buffer_store_dword(4 + r, 9, 8, 4 * u32::from(r)));
+    }
+    w.push(S_ENDPGM);
+    let mut native = program(
+        &w,
+        false,
+        [4, 1, 1],
+        vec![table(0, 0), constant_at_s2()],
+        vec![used(ResourceType::Uav, 0, 4, 0)],
+    );
+    // The group info in s3.
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 10;
+    }
+    native
+}
+
+/// A 16-bit result in a register whose other half no translation has:
+/// what reads only the result's half sees it (as an f16, shifted to the
+/// top, masked, as SDWA's low word).
+#[test]
+fn a_mixed_precision_result_beside_a_missing_half_is_read_alone() {
+    let _serial = serial();
+    let read = [
+        vop1(V_CVT_F32_F16, 4, vgpr(1)),
+        vop2(V_LSHLREV_B32, 5, k(16), 1),
+        vop2(V_AND_B32, 6, LIT, 1),
+        0xFFFF,
+        vop1(V_MOV_B32, 7, SDWA),
+        sdwa_src0(1, 4),
+    ];
+    let shader = translate(&kept_half(&read)).unwrap();
+    run(&shader, &[View::RawUav(16)], 0, |label, out| {
+        for t in 0..4 {
+            let f = 2.0 * t as f32 + 0.5;
+            let h = f16_bits(f);
+            assert_eq!(
+                out[4 * t..4 * t + 4],
+                [f.to_bits(), h << 16, h, h],
+                "{label}, thread {t}"
+            );
+        }
+    });
+}
+
+/// What reads the missing half, or the whole dword, stays refused for it.
+#[test]
+fn reads_of_a_missing_half_stay_refused() {
+    let _serial = serial();
+    let reads: [&[u32]; 4] = [
+        &[vop2(V_LSHRREV_B32, 4, k(16), 1)],
+        &[vop1(V_MOV_B32, 4, vgpr(1))],
+        &[vop1(V_MOV_B32, 4, SDWA), sdwa_src0(1, 5)],
+        &[vop2(V_AND_B32, 4, LIT, 1), 0x1_FFFF],
+    ];
+    for read in reads {
+        assert_eq!(
+            refusal(&kept_half(read)),
+            "the thread-group info SGPR",
+            "{read:x?}"
+        );
+    }
+}
+
+/// [`kept_half`]'s mixed-precision write where the root constant is not
+/// 0, a whole dword (0x4040_4040, f16 2.125 in each half) where it is,
+/// then `read` of v1 into v4 after the join, stored at 4 × thread. With
+/// `twice`, a second join first: v1 is overwritten (0x1234_5678, f16 103.5
+/// in its low half) where the constant is 0, so only that join takes the
+/// first.
+fn kept_half_joined(read: u32, twice: bool) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.push(vop1(V_MOV_B32, 1, 3));
+    w.push(vop1(V_CVT_F32_U32, 2, vgpr(0)));
+    w.push(s_cmp_eq_u32(2, k(0)));
+    w.push(s_cbranch_scc1(3));
+    w.extend(vop3p(V_FMA_MIXLO_F16, 1, vgpr(2), INLINE_TWO, INLINE_HALF));
+    w.push(s_branch(2));
+    w.extend([vop1(V_MOV_B32, 1, LIT), 0x4040_4040]);
+    if twice {
+        w.push(s_cmp_lg_u32(2, k(0)));
+        w.push(s_cbranch_scc1(2));
+        w.extend([vop1(V_MOV_B32, 1, LIT), 0x1234_5678]);
+    }
+    w.push(read);
+    w.push(vop2(V_LSHLREV_B32, 9, k(2), 0));
+    w.extend(buffer_store_dword(4, 9, 8, 0));
+    w.push(S_ENDPGM);
+    let mut native = program(
+        &w,
+        false,
+        [4, 1, 1],
+        vec![table(0, 0), constant_at_s2()],
+        vec![used(ResourceType::Uav, 0, 4, 0)],
+    );
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 10;
+    }
+    native
+}
+
+/// The join of a dword known in its low half and a whole one is known in
+/// its low half: an f16 read sees the path's value, a whole read is
+/// refused.
+#[test]
+fn a_join_knows_the_bits_every_path_knows() {
+    let _serial = serial();
+    let shader = translate(&kept_half_joined(vop1(V_CVT_F32_F16, 4, vgpr(1)), false)).unwrap();
+    for constant in [0, 1] {
+        run(&shader, &[View::RawUav(4)], constant, |label, out| {
+            for (t, &x) in out.iter().enumerate() {
+                let want = if constant == 0 {
+                    2.125
+                } else {
+                    2.0 * t as f32 + 0.5
+                };
+                assert_eq!(f32::from_bits(x), want, "{label}, {constant}, thread {t}");
+            }
+        });
+    }
+    assert_eq!(
+        refusal(&kept_half_joined(vop1(V_MOV_B32, 4, vgpr(1)), false)),
+        "the thread-group info SGPR"
+    );
+}
+
+/// So does a join only another join takes: through both, an f16 read sees
+/// the path's value, and a whole read is refused (it would see the
+/// stand-in for the missing high half).
+#[test]
+fn a_join_only_a_join_takes_knows_the_same_bits() {
+    let _serial = serial();
+    let shader = translate(&kept_half_joined(vop1(V_CVT_F32_F16, 4, vgpr(1)), true)).unwrap();
+    assert_eq!(f16_bits(103.5), 0x5678);
+    for constant in [0, 1] {
+        run(&shader, &[View::RawUav(4)], constant, |label, out| {
+            for (t, &x) in out.iter().enumerate() {
+                let want = if constant == 0 {
+                    103.5
+                } else {
+                    2.0 * t as f32 + 0.5
+                };
+                assert_eq!(f32::from_bits(x), want, "{label}, {constant}, thread {t}");
+            }
+        });
+    }
+    assert_eq!(
+        refusal(&kept_half_joined(vop1(V_MOV_B32, 4, vgpr(1)), true)),
+        "the thread-group info SGPR"
+    );
+}
+
+/// A pixel program reading the perspective-center barycentrics (v0, v1)
+/// and the attributes `inputs` describe, through the whole translator,
+/// with `sig` its input signature (by register; 16-bit elements marked as
+/// the console's containers mark them) and one f32 render target.
+fn translate_pixel(
+    words: &[u32],
+    inputs: Vec<PsInput>,
+    sig: &[SigElement],
+) -> Result<HostShader, ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs,
+            input_addr: 1 << 1,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let mut isg1 = super::container::signature(sig, true);
+    for (i, e) in sig.iter().enumerate() {
+        if e.half {
+            // Component type 6: f16.
+            isg1[8 + 32 * i + 16..][..4].copy_from_slice(&6u32.to_le_bytes());
+        }
+    }
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let osg1 = super::container::signature(&[target], false);
+    let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).unwrap();
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let res = resource::track(&p, &native.layout, native.stage)?;
+    let io = io::raise(&p, &native)?;
+    let st = structure::structure(&p)?;
+    let shader = super::emit(&c, &native, &p, &st, &io, &res)?;
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation");
+    }
+    Ok(shader)
+}
+
+/// A vertex shader for `ps`: `SV_Position` from `POSITION`, and channel c
+/// of each input of `ps` (element of semantic index i) the constant
+/// 4i + c + 0.5.
+fn constant_vs(ps: &HostShader) -> HostShader {
+    use super::bitcode::{Attr, Term};
+    let c = Container::parse(&ps.dxil).unwrap();
+    let mut outputs: Vec<SigElement> = super::signature(c.part(FourCC::ISG1).unwrap().data)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == 0)
+        .collect();
+    let row = outputs.iter().filter_map(|e| e.row).map(|r| r + 1).max();
+    let mut position = SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(row.unwrap_or(0)),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    outputs.push(position.clone());
+    let mut s = super::shader::Shader::new(false);
+    (position.name, position.kind, position.row) = ("POSITION".into(), 0, Some(0));
+    (position.interp, position.usage) = (0, 0xF);
+    s.inputs.push(position);
+    let b = s.entry;
+    for (id, e) in outputs.iter().enumerate() {
+        for col in 0..e.cols {
+            let x = if e.kind == 3 {
+                let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+            } else {
+                let x = 4.0 * e.index as f32 + f32::from(col) + 0.5;
+                s.m.f32(x.to_bits())
+            };
+            let args = [s.m.i32(id as u32), s.m.i32(0), s.m.i8(col), x];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+    }
+    s.outputs = outputs
+        .into_iter()
+        .map(|mut e| {
+            e.usage = (1 << e.cols) - 1;
+            e
+        })
+        .collect();
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        stride_table: false,
+    }
+}
+
+/// Draws `ps` over a 4×4 target on every host device there is, after
+/// [`constant_vs`], and checks each texel is `want`.
+fn draw_pixel(ps: &HostShader, want: [f32; 4]) {
+    let vs = constant_vs(ps);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut vs.dxil.clone()).expect("DXIL validation");
+    }
+    // A triangle over the whole target.
+    let vertices = [
+        -1.0, -1.0, 0.5, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, //
+        3.0, -1.0, 0.5, 1.0,
+    ];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .pipeline(&vs, ps)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let out = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &vertices,
+                    stride: 16,
+                    size: (4, 4),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        for (i, texel) in out.iter().enumerate() {
+            assert_eq!(*texel, want, "{label}, texel {i}");
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 device; not drawn");
+    }
+}
+
+/// An interpolation attribute code: attribute `index`, channel `chan`,
+/// the high f16 half with `high`.
+const fn attr(index: u16, chan: u16, high: bool) -> u16 {
+    index | chan << 6 | (high as u16) << 8
+}
+
+const V_INTERP_P1LL_F16: u32 = 0x342;
+const V_INTERP_P2_F16: u32 = 0x35A;
+
+/// `v_interp_p1ll_f16` then `v_interp_p2_f16` of `code` into `dst`, the
+/// second keeping the first's high half in `dst`.
+fn interp_f16(dst: u8, code: u16) -> [u32; 4] {
+    let [a, b] = vop3(V_INTERP_P1LL_F16, dst, code, vgpr(0), 0);
+    let [c, d] = vop3(V_INTERP_P2_F16, dst, code, vgpr(1), vgpr(dst));
+    [a, b, c, d]
+}
+
+/// `exp mrt0, v4, v5, v6, v7 done vm`.
+const EXP_V4_V7: [u32; 2] = [0xF800_180F, 0x0706_0504];
+
+fn half_input(name: &str, index: u32, row: u32, col: u8, cols: u8) -> SigElement {
+    SigElement {
+        name: name.into(),
+        index,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(row),
+        col,
+        cols,
+        usage: 0,
+        half: true,
+    }
+}
+
+fn packed(attr: u8, row: u8, row2: u8) -> PsInput {
+    PsInput {
+        usage: Usage::Generic,
+        row,
+        mask: 3,
+        attr,
+        flat: false,
+        fp16: true,
+        pack2: true,
+        row2,
+    }
+}
+
+/// Two parameters of 16-bit values packed two per dword. Attribute 0: row
+/// 0 (TEXCOORD0.xy, TEXCOORD8.xy), the stage data naming no second row,
+/// then the next 16-bit row no entry names (TEXCOORD1, row 1), as the
+/// producer packs it. Attribute 1: row 2 (TEXCOORD2.xyz, a half of
+/// padding), then the row the stage data names, `named` (TEXCOORD3 at row
+/// 3, or TEXCOORD4 at 4 after it). The program reads halves 4 and 7 of
+/// attribute 0, half 3 of it and half 4 of attribute 1, and writes them as
+/// floats.
+fn packed_reader(named: u8) -> Result<HostShader, ShaderError> {
+    let mut w = Vec::new();
+    w.extend(interp_f16(2, attr(0, 2, false)));
+    w.extend(interp_f16(3, attr(0, 3, true)));
+    w.extend(interp_f16(8, attr(0, 1, true)));
+    w.extend(interp_f16(9, attr(1, 2, false)));
+    for (dst, src) in [(4, 2), (5, 3), (6, 8), (7, 9)] {
+        w.push(vop1(V_CVT_F32_F16, dst, vgpr(src)));
+    }
+    w.extend(EXP_V4_V7);
+    w.push(S_ENDPGM);
+    let mut sig = vec![
+        half_input("TEXCOORD", 0, 0, 0, 2),
+        half_input("TEXCOORD", 8, 0, 2, 2),
+        half_input("TEXCOORD", 1, 1, 0, 4),
+        half_input("TEXCOORD", 2, 2, 0, 3),
+        half_input("TEXCOORD", 3, 3, 0, 2),
+    ];
+    if named == 4 {
+        sig.push(half_input("TEXCOORD", 4, 4, 0, 2));
+    }
+    translate_pixel(&w, vec![packed(0, 0, 0), packed(1, 2, named)], &sig)
+}
+
+/// The partner the stage data leaves unnamed is the row the producer packs
+/// there: TEXCOORD1.x and .w (4.5, 7.5), TEXCOORD8.y (33.5), and through
+/// the named partner TEXCOORD3.x (12.5).
+#[test]
+fn a_packed_input_finds_the_row_its_stage_data_leaves_unnamed() {
+    let _serial = serial();
+    let ps = packed_reader(3).unwrap();
+    draw_pixel(&ps, [4.5, 7.5, 33.5, 12.5]);
+}
+
+/// Where the producer's rule does not give a second row the stage data
+/// names (here TEXCOORD4, not TEXCOORD3), it is not taken for the
+/// unnamed ones either.
+#[test]
+fn an_unnamed_partner_the_named_ones_contradict_stays_refused() {
+    let _serial = serial();
+    assert!(
+        matches!(
+            packed_reader(4),
+            Err(ShaderError::Unsupported {
+                what: "a packed input half no element holds",
+                ..
+            })
+        ),
+        "{:?}",
+        packed_reader(4).map(|s| s.stage)
+    );
+}
+
+/// Nor where a 16-bit row is left over. The producer packs rows 0 and 1
+/// with rows 2 and 3; this stage data leaves out the parameter at row 0
+/// (unread), so row 0 joins the free rows and the rule would pair row 1
+/// with row 2.
+#[test]
+fn an_unnamed_partner_beside_a_row_left_over_stays_refused() {
+    let _serial = serial();
+    let mut w = Vec::new();
+    w.extend(interp_f16(2, attr(0, 2, false)));
+    w.push(vop1(V_CVT_F32_F16, 4, vgpr(2)));
+    for r in 5..8 {
+        w.push(vop1(V_MOV_B32, r, k(0)));
+    }
+    w.extend(EXP_V4_V7);
+    w.push(S_ENDPGM);
+    let sig: Vec<_> = (0..4).map(|r| half_input("TEXCOORD", r, r, 0, 4)).collect();
+    let ps = translate_pixel(&w, vec![packed(0, 1, 1)], &sig);
+    assert!(
+        matches!(
+            ps,
+            Err(ShaderError::Unsupported {
+                what: "a packed input half no element holds",
+                ..
+            })
+        ),
+        "{:?}",
+        ps.map(|s| s.stage)
+    );
+}
+
+/// A pixel program whose `v_fma_mixlo_f16` writes f16(1.5 × 1.5 + 0.5) =
+/// 2.75 into the low half of v0, which holds the barycentric i; `read`
+/// then reads v0 into v4-v7, which it writes.
+fn mixed_over_barycentric(read: &[u32]) -> Result<HostShader, ShaderError> {
+    let mut w = vec![vop1(V_MOV_B32, 2, LIT), 1.5f32.to_bits()];
+    w.push(vop1(V_MOV_B32, 3, INLINE_HALF));
+    w.extend(vop3p(V_FMA_MIXLO_F16, 0, vgpr(2), vgpr(2), vgpr(3)));
+    w.extend(read);
+    w.extend(EXP_V4_V7);
+    w.push(S_ENDPGM);
+    translate_pixel(&w, vec![], &[])
+}
+
+/// The barycentric's half stays out of the result: f16 2.75 (0x4180) read
+/// as an f16, shifted to the top (16.0 as a float), masked and as SDWA's
+/// low word (16768 converted).
+#[test]
+fn a_result_beside_a_barycentric_half_is_read_alone() {
+    let _serial = serial();
+    let read = [
+        vop1(V_CVT_F32_F16, 4, vgpr(0)),
+        vop2(V_LSHLREV_B32, 5, k(16), 0),
+        vop2(V_AND_B32, 6, LIT, 0),
+        0xFFFF,
+        vop1(V_CVT_F32_U32, 6, vgpr(6)),
+        vop1(V_MOV_B32, 7, SDWA),
+        sdwa_src0(0, 4),
+        vop1(V_CVT_F32_U32, 7, vgpr(7)),
+    ];
+    let ps = mixed_over_barycentric(&read).unwrap();
+    assert_eq!(f16_bits(2.75), 0x4180);
+    draw_pixel(&ps, [2.75, 16.0, 16768.0, 16768.0]);
+}
+
+/// Reading the barycentric's half stays refused: which two of the three
+/// weights the console's i and j are depends on the vertex order its
+/// hardware rasterised in.
+#[test]
+fn a_barycentric_half_read_stays_refused() {
+    let _serial = serial();
+    let reads: [&[u32]; 2] = [
+        &[vop2(V_LSHRREV_B32, 4, k(16), 0)],
+        &[vop1(V_MOV_B32, 4, vgpr(0))],
+    ];
+    for read in reads {
+        assert!(
+            matches!(
+                mixed_over_barycentric(read),
+                Err(ShaderError::Unsupported {
+                    what: "barycentrics read directly",
+                    ..
+                })
+            ),
+            "{read:x?}"
+        );
+    }
+}
+
+/// SOPP `s_cbranch_vccnz` over `n` dwords.
+const fn s_cbranch_vccnz(n: u32) -> u32 {
+    0xBF87_0000 | n
+}
+
+const S_ANDN2_B32: u32 = 0x14;
+const S_NOP: u32 = 0xBF80_0000;
+const INLINE_MINUS_1: u16 = 193;
+
+/// The console compiler's skip over a leftover: a raw buffer's descriptor
+/// sits in s[12:15]; where the root constant is not 0 the code reads two
+/// dwords of the buffer into s12 and s13 and sets the flag in v2, else it
+/// skips both, leaving the descriptor's first two dwords there. After the
+/// join, lanes with the flag clear jump past the read of s12 and s13:
+/// 7 then, else s12 + s13, stored at 4 × thread. `flag` is what v2 holds
+/// on the skip.
+fn leftover(flag: u16) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(2, 12, 0, 0x20));
+    w.push(vop1(V_MOV_B32, 2, flag));
+    w.push(s_cmp_eq_u32(2, k(0)));
+    w.push(s_cbranch_scc1(4));
+    // s_buffer_load_dwordx2 s[12:13], s[12:15], 0
+    w.extend([0xF424_0000 | 12 << 6 | 12 >> 1, 125 << 25]);
+    w.push(vop1(V_MOV_B32, 2, INLINE_MINUS_1));
+    w.push(s_branch(1));
+    w.push(S_NOP);
+    // The join.
+    w.push(vopc(V_CMP_EQ_U32, INLINE_MINUS_1, 2));
+    w.push(sop2(S_ANDN2_B32, VCC_LO as u8, EXEC_LO, VCC_LO));
+    w.push(vop1(V_MOV_B32, 3, k(7)));
+    w.push(s_cbranch_vccnz(2));
+    w.push(vop1(V_MOV_B32, 3, 12));
+    w.push(vop2(V_ADD_NC_U32, 3, 13, 3));
+    w.push(vop2(V_LSHLREV_B32, 5, k(2), 0));
+    w.extend(buffer_store_dword(3, 5, 8, 0));
+    w.push(S_ENDPGM);
+    let raw = UsedResource {
+        stride: 1,
+        ..used(ResourceType::Srv, 8, 4, 0)
+    };
+    program(
+        &w,
+        false,
+        [4, 1, 1],
+        vec![table(0, 0), constant_at_s2()],
+        vec![used(ResourceType::Uav, 0, 4, 0), raw],
+    )
+}
+
+/// The lanes that bring the descriptor's dwords to the join never read
+/// them: the program translates, and each path gives its own result.
+#[test]
+fn a_leftover_descriptor_no_lane_reads_joins_a_stand_in() {
+    let _serial = serial();
+    let shader = translate(&leftover(k(0))).unwrap();
+    let data = [0x100, 0x20, 0x3, 0x4];
+    let views = [
+        View::RawUav(4),
+        View::Buffer {
+            data: &data,
+            stride: super::host::Stride::Raw,
+        },
+    ];
+    for constant in [0, 1] {
+        run(&shader, &views, constant, |label, out| {
+            let want = if constant == 0 { 7 } else { 0x120 };
+            assert_eq!(out, [want; 4], "{label}, {constant}");
+        });
+    }
+}
+
+/// Where the skip sets the flag, or leaves it unknown, those lanes read
+/// the leftover: refused as before.
+#[test]
+fn a_leftover_some_lane_may_read_stays_refused() {
+    let _serial = serial();
+    for flag in [INLINE_MINUS_1, vgpr(0)] {
+        assert_eq!(
+            refusal(&leftover(flag)),
+            "a descriptor's address or format read as data",
+            "{flag}"
+        );
+    }
+}
+
+/// A buffer descriptor only read as numbers (its third dword: the record
+/// count, 0 for a null view): 4 × thread gets the count, then 5 where it
+/// is 0, else 9.
+fn records_only(stride: u32) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(2, 12, 0, 0x20));
+    w.push(vop1(V_MOV_B32, 3, 14));
+    w.push(vop1(V_MOV_B32, 4, k(5)));
+    w.push(s_cmp_eq_u32(14, k(0)));
+    w.push(s_cbranch_scc1(1));
+    w.push(vop1(V_MOV_B32, 4, k(9)));
+    w.push(vop2(V_LSHLREV_B32, 6, k(3), 0));
+    w.extend(buffer_store_dword(3, 6, 8, 0));
+    w.extend(buffer_store_dword(4, 6, 8, 4));
+    w.push(S_ENDPGM);
+    let entry = UsedResource {
+        stride,
+        ..used(ResourceType::Srv, 8, 4, 0)
+    };
+    program(
+        &w,
+        false,
+        [2, 1, 1],
+        vec![table(0, 0)],
+        vec![used(ResourceType::Uav, 0, 4, 0), entry],
+    )
+}
+
+/// Its table entry says what the view is: structured, its records; raw,
+/// its bytes; null, none.
+#[test]
+fn a_buffer_only_read_as_data_is_the_view_its_entry_names() {
+    let _serial = serial();
+    let data: Vec<u32> = (0..32).collect();
+    let cases = [
+        (16, super::host::Stride::Structured(16), Some(&data[..]), 8),
+        (1, super::host::Stride::Raw, Some(&data[..]), 128),
+        (16, super::host::Stride::Structured(16), None, 0),
+        (1, super::host::Stride::Raw, None, 0),
+    ];
+    for (entry, stride, data, want) in cases {
+        let shader = translate(&records_only(entry)).unwrap();
+        let view = match data {
+            Some(data) => View::Buffer { data, stride },
+            None => View::NullBuffer(stride),
+        };
+        let flag = if want == 0 { 5 } else { 9 };
+        run(&shader, &[View::RawUav(4), view], 0, |label, out| {
+            assert_eq!(
+                out,
+                [want, flag, want, flag],
+                "{label}, entry stride {entry}"
+            );
+        });
+    }
+}
+
+/// A stride of 4 is also a typed buffer's, whose view a raw or structured
+/// handle may not read: refused.
+#[test]
+fn a_buffer_only_read_as_data_with_a_typed_stride_stays_refused() {
+    let _serial = serial();
+    for stride in [4, 2, 0] {
+        assert_eq!(
+            refusal(&records_only(stride)),
+            "a descriptor read only as data",
+            "{stride}"
+        );
+    }
+}
+
+const V_BFE_U32: u32 = 0x148;
+const V_ALIGNBIT_B32: u32 = 0x14E;
+
+/// An image's descriptor (s[12:19]) used by an `image_load` of
+/// dimension `dim` (1 2D, 5 2D array; layer 0) and read as numbers by
+/// `read`, which leaves four results in v3-v6, stored at 16 × thread.
+fn image_fields(dim: u32, read: &[u32]) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(3, 12, 0, 0x20));
+    w.push(vop1(V_MOV_B32, 2, k(0)));
+    w.extend(mimg(IMAGE_LOAD, 7, 0, 12, 0, 1, dim, false));
+    w.extend(read);
+    w.push(vop2(V_LSHLREV_B32, 8, k(4), 0));
+    for (r, at) in [(3, 0), (4, 4), (5, 8), (6, 12)] {
+        w.extend(buffer_store_dword(r, 8, 8, at));
+    }
+    w.push(S_ENDPGM);
+    program(
+        &w,
+        false,
+        [2, 1, 1],
+        vec![table(0, 0)],
+        vec![
+            used(ResourceType::Uav, 0, 4, 0),
+            used(ResourceType::Srv, 8, 8, 0),
+        ],
+    )
+}
+
+/// The fields the console compiler reads sizes from, as it reads them:
+/// the last level (dword 3 bits 16-19), the depth or last layer (dword 4,
+/// masked by a register it moved 0xFFFF into), the width (bits 30-31 of
+/// dword 1 and 0-13 of dword 2 by `v_alignbit_b32`), the height (dword 2
+/// bits 14-29 by `v_bfe_u32`).
+fn size_read() -> Vec<u32> {
+    let mut read = vec![sop2(S_BFE_U32, 2, 15, LIT), 0x0004_0010];
+    read.extend([s_mov_b32(0, LIT), 0xFFFF, sop2(S_AND_B32, 3, 16, 0)]);
+    read.extend(vop3(V_ALIGNBIT_B32, 5, 14, 13, k(30)));
+    read.extend([vop2(V_AND_B32, 5, LIT, 5), 0xFFFF]);
+    read.extend(vop3(V_BFE_U32, 6, 14, k(14), k(16)));
+    read.extend([vop1(V_MOV_B32, 3, 2), vop1(V_MOV_B32, 4, 3)]);
+    read
+}
+
+#[test]
+fn image_size_fields_read_as_the_compiler_reads_them() {
+    let _serial = serial();
+    let shader = translate(&image_fields(5, &size_read())).unwrap();
+    let texels: Vec<[f32; 4]> = (0..96).map(|i| [i as f32, 0.0, 0.0, 1.0]).collect();
+    let views = [View::RawUav(8), View::Layers(8, 4, 3, &texels)];
+    run(&shader, &views, 0, |label, out| {
+        assert_eq!(out, [0, 2, 7, 3, 0, 2, 7, 3], "{label}");
+    });
+    // The last level, with levels and no layers.
+    let mut read = vec![sop2(S_BFE_U32, 2, 15, LIT), 0x0004_0010];
+    read.extend([vop1(V_MOV_B32, 3, 2), vop1(V_MOV_B32, 4, k(0))]);
+    read.extend([vop1(V_MOV_B32, 5, k(0)), vop1(V_MOV_B32, 6, k(0))]);
+    let shader = translate(&image_fields(1, &read)).unwrap();
+    let views = [View::RawUav(8), View::Levels(8, 4, 3, &texels[..42])];
+    run(&shader, &views, 0, |label, out| {
+        assert_eq!(out, [2, 0, 0, 0, 2, 0, 0, 0], "{label}");
+    });
+}
+
+/// The rest of those dwords (format, swizzle, tiling, the address's high
+/// bits, a 2D view's depth field) has no host value: reading it stays
+/// refused.
+#[test]
+fn other_bits_of_image_size_dwords_stay_refused() {
+    let _serial = serial();
+    let reads: [(u32, &[u32]); 5] = [
+        (1, &[vop1(V_MOV_B32, 3, 13)]),
+        (
+            1,
+            &[sop2(S_AND_B32, 2, 15, LIT), 0xFFF, vop1(V_MOV_B32, 3, 2)],
+        ),
+        (
+            5,
+            &[
+                s_mov_b32(0, LIT),
+                0x1_FFFF,
+                sop2(S_AND_B32, 2, 16, 0),
+                vop1(V_MOV_B32, 3, 2),
+            ],
+        ),
+        (1, &[sop2(S_LSHR_B32, 2, 14, k(31)), vop1(V_MOV_B32, 3, 2)]),
+        (1, &size_read()),
+    ];
+    for (dim, read) in reads {
+        assert_eq!(
+            refusal(&image_fields(dim, read)),
+            "a descriptor's address or format read as data",
+            "{dim}, {read:x?}"
+        );
+    }
+}
+
+/// [`leftover`] with an image's second descriptor dword, known only in
+/// its width bits, as the leftover in s13 (the data from a raw buffer).
+fn leftover_image_dword(flag: u16) -> NativeProgram {
+    let mut w = vec![s_mov_b32(1, k(0))];
+    w.extend(s_load(2, 8, 0, 0));
+    w.extend(s_load(3, 12, 0, 0x20));
+    w.extend(s_load(2, 20, 0, 0x40));
+    w.extend(image_2d(IMAGE_LOAD, 7, 0, 12, 0));
+    w.push(vop1(V_MOV_B32, 2, flag));
+    w.push(s_cmp_eq_u32(2, k(0)));
+    w.push(s_cbranch_scc1(4));
+    // s_buffer_load_dword s13, s[20:23], 0
+    w.extend([0xF420_0000 | 13 << 6 | 20 >> 1, 125 << 25]);
+    w.push(vop1(V_MOV_B32, 2, INLINE_MINUS_1));
+    w.push(s_branch(1));
+    w.push(S_NOP);
+    w.push(vopc(V_CMP_EQ_U32, INLINE_MINUS_1, 2));
+    w.push(sop2(S_ANDN2_B32, VCC_LO as u8, EXEC_LO, VCC_LO));
+    w.push(vop1(V_MOV_B32, 3, k(7)));
+    w.push(s_cbranch_vccnz(1));
+    w.push(vop1(V_MOV_B32, 3, 13));
+    w.push(vop2(V_LSHLREV_B32, 5, k(2), 0));
+    w.extend(buffer_store_dword(3, 5, 8, 0));
+    w.push(S_ENDPGM);
+    let raw = UsedResource {
+        stride: 1,
+        ..used(ResourceType::Srv, 16, 4, 0)
+    };
+    program(
+        &w,
+        false,
+        [2, 1, 1],
+        vec![table(0, 0), constant_at_s2()],
+        vec![
+            used(ResourceType::Uav, 0, 4, 0),
+            used(ResourceType::Srv, 8, 8, 0),
+            raw,
+        ],
+    )
+}
+
+/// A dword known only in part is a leftover like one not known at all.
+#[test]
+fn a_leftover_image_dword_no_lane_reads_joins_a_stand_in() {
+    let _serial = serial();
+    let shader = translate(&leftover_image_dword(k(0))).unwrap();
+    let texels: Vec<[f32; 4]> = vec![[0.0; 4]; 8];
+    let data = [0x1234_5678, 1, 2, 3];
+    let views = [
+        View::RawUav(2),
+        View::Texture(4, 2, &texels),
+        View::Buffer {
+            data: &data,
+            stride: super::host::Stride::Raw,
+        },
+    ];
+    for constant in [0, 1] {
+        run(&shader, &views, constant, |label, out| {
+            let want = if constant == 0 { 7 } else { 0x1234_5678 };
+            assert_eq!(out, [want; 2], "{label}, {constant}");
+        });
+    }
+    assert_eq!(
+        refusal(&leftover_image_dword(INLINE_MINUS_1)),
+        "a descriptor's address or format read as data"
+    );
 }

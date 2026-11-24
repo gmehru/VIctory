@@ -98,6 +98,7 @@ mod sampler;
 mod shader;
 #[cfg(all(test, windows))]
 mod synth_tests;
+mod unseen;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
