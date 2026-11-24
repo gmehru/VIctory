@@ -228,22 +228,35 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    /// [`Self::meet`] of `all`; `unmet` holds the conditions already found
+    /// unsatisfiable (the branches of the diagrams meet again below a split,
+    /// and each such set is searched once).
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        unmet: &mut HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.sort_unstable();
+        all.dedup();
+        if unmet.contains(&all) {
+            return false;
+        }
         if all.is_empty() || *budget == 0 {
             return true;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let met = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -251,8 +264,13 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, unmet)
+        });
+        // A search the budget cut short says yes, so a no is complete.
+        if !met {
+            unmet.insert(all);
+        }
+        met
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -353,6 +371,10 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// For each mask joined by a phi that stays a variable ([`Atom::Phi`],
+    /// by the value it names): the lane's bit of the mask coming in on
+    /// each edge, in predecessor order.
+    pub joins: HashMap<Value, Vec<Bool>>,
 }
 
 impl Structured {
@@ -371,6 +393,8 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
+        // Before the check: reading an edge can resolve a join to a constant.
+        l.join_masks();
         let wrong = l.wrong_joins(&cond);
         if wrong.is_empty() {
             return l.finish(&execs, &cond);
@@ -413,6 +437,10 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// Joins left as [`Atom::Phi`]: the incoming masks.
+    phi_joins: Vec<(Value, Vec<Key>)>,
+    /// See [`Structured::joins`]; for the first joins of `phi_joins`.
+    join_bits: HashMap<Value, Vec<Bool>>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -476,6 +504,8 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            phi_joins: Vec::new(),
+            join_bits: HashMap::new(),
         })
     }
 
@@ -488,6 +518,18 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.phi_joins.clear();
+        self.join_bits.clear();
+    }
+
+    /// The masks on the edges of each join left a variable, back edges
+    /// included (one may be a join itself, found only here).
+    fn join_masks(&mut self) {
+        while self.join_bits.len() < self.phi_joins.len() {
+            let (id, args) = self.phi_joins[self.join_bits.len()].clone();
+            let bits = args.into_iter().map(|k| self.mask(k).0).collect();
+            self.join_bits.insert(id, bits);
+        }
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -586,6 +628,15 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        // Joins that checking the others brought up: kept unless reading
+        // their edges resolved a join to a constant, which nothing checks
+        // any more.
+        let (checked, known) = (self.joins.len(), self.join_bits.clone());
+        self.join_masks();
+        if self.joins.len() != checked {
+            self.join_bits = known;
+        }
+        let joins = std::mem::take(&mut self.join_bits);
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -634,6 +685,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            joins,
             bools: self.b,
             exits,
             guards,
@@ -768,6 +820,9 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
+        if self.phi_joins.iter().all(|j| j.0 != id) {
+            self.phi_joins.push((id, args));
+        }
         Some((self.b.atom(Atom::Phi(id), born), derived))
     }
 
@@ -1191,6 +1246,55 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    #[test]
+    fn meet_searches_each_set_of_conditions_once() {
+        // The parity of 20 lanes' bits and its negation never hold at once.
+        // Every split leaves both undecided, so a search that forgets what
+        // it refuted takes 2^20 steps, past its budget, and says yes.
+        let mut b = Bools::new();
+        let mut parity = Bool::FALSE;
+        for k in 0..20 {
+            let x = b.atom(Atom::Lane(Value(k)), 0);
+            parity = b.xor(parity, x);
+        }
+        assert!(!b.meet(&[(parity, true), (parity, false)]));
+        assert!(b.meet(&[(parity, true)]));
+        assert!(b.meet(&[(parity, false)]));
+    }
+
+    #[test]
+    fn a_join_knows_the_mask_on_each_edge() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBF06_0504, // s_cmp_eq_u32 s4, s5
+                0xBF85_0002, // s_cbranch_scc1 -> 20
+                0xBE80_036A, // s_mov_b32 s0, vcc_lo
+                0xBF82_0001, // s_branch -> 24
+                0xBE80_0380, // 20: s_mov_b32 s0, 0
+                0x877E_007E, // 24: s_and_b32 exec_lo, exec_lo, s0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        // One path brings the compare, the other no lane: neither is the
+        // whole join, and the constant is no mask by its value alone.
+        let [(id, bits)] = &s.joins.iter().collect::<Vec<_>>()[..] else {
+            panic!("{:?}", s.joins)
+        };
+        let join = p.blocks.iter().find(|b| b.preds.len() == 2).unwrap();
+        assert!(join.phis.iter().any(|phi| phi.value == **id));
+        let [compare, none] = bits[..] else {
+            panic!("{bits:?}")
+        };
+        assert!(matches!(s.bools.support(compare)[..], [Atom::Lane(_)]));
+        assert_eq!(none, Bool::FALSE);
+        let g = s.guards[3][1].expect("guard");
+        assert!(matches!(s.bools.support(g)[..], [Atom::Phi(v)] if v == **id));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Survey shader containers: bitcode, console additions and native code.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -52,6 +52,41 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     out
 }
 
+/// `VICTORY_ONLY` names a file of container hashes, one per line (the 16
+/// hex digits the runtime logs for a shader): `translate` and `shader-info`
+/// then handle only those containers (`translate` each once, and `--list`
+/// shows the hash with each). `VICTORY_ONLY=all` names every container:
+/// the empty set.
+pub(crate) fn only_from_env() -> Result<Option<HashSet<String>>> {
+    let Ok(file) = std::env::var("VICTORY_ONLY") else {
+        return Ok(None);
+    };
+    if file == "all" {
+        return Ok(Some(HashSet::new()));
+    }
+    let text = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("VICTORY_ONLY: cannot read {file}: {e}"))?;
+    let only: HashSet<String> = text
+        .split_whitespace()
+        .map(|h| h.to_ascii_lowercase())
+        .collect();
+    anyhow::ensure!(!only.is_empty(), "VICTORY_ONLY: {file} names no hash");
+    Ok(Some(only))
+}
+
+/// Whether `VICTORY_ONLY`'s set names the container with this hash.
+pub(crate) fn wanted(only: &HashSet<String>, hash: &str) -> bool {
+    only.is_empty() || only.contains(hash)
+}
+
+/// The runtime's identity of a container: the BLAKE3 of its bytes. A raw
+/// source runs to the end of its file, so the length is the header's.
+pub(crate) fn container_hash(bytes: &[u8]) -> Option<blake3::Hash> {
+    Container::parse(bytes).ok()?;
+    let total = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?);
+    Some(blake3::hash(bytes.get(..total as usize)?))
+}
+
 #[derive(Default)]
 struct Totals {
     containers: usize,
@@ -73,6 +108,7 @@ struct Totals {
 
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let only = only_from_env()?;
     let mut t = Totals::default();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -99,6 +135,13 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                let hash = only.as_ref().and_then(|_| container_hash(&bytes));
+                let hash = hash.map(|h| h.to_hex()[..16].to_owned());
+                if let (Some(only), Some(hash)) = (&only, &hash)
+                    && !wanted(only, hash)
+                {
+                    continue;
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
@@ -125,6 +168,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         listing
                                             .extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                         listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                                        // What the hardware loads on entry
+                                        // (the register layout's source).
+                                        listing.push(format!("    {:?}", n.io));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );
@@ -169,7 +215,8 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    let hash = hash.map_or(String::new(), |h| format!(" #{h}"));
+                    println!("{}{}{hash}: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }

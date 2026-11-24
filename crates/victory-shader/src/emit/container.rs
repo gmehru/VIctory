@@ -140,9 +140,13 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
+    /// The entry function's name, for a module that names validator 1.8:
+    /// runtime info version 3 then.
+    pub entry: Option<&'a str>,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2 (validator 1.6), or version 3
+/// (validator 1.8: the entry function's name follows) with [`Psv::entry`].
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -158,7 +162,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[if p.entry.is_some() { 52 } else { 48 }]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -190,6 +194,13 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[30] = p.prims.len() as u8;
     }
     out.extend(info);
+    // Names of arbitrary semantics (system values use ""), then indices;
+    // before them, the entry function's name.
+    let mut strings = vec![0u8];
+    if let Some(entry) = p.entry {
+        u32s(&mut out, &[strings.len() as u32]);
+        strings.extend(entry.bytes().chain([0]));
+    }
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -200,8 +211,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // Names of arbitrary semantics (system values use ""), then indices.
-    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {

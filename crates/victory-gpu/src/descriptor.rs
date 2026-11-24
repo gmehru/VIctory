@@ -636,6 +636,29 @@ pub(crate) extern "system" fn create_heap(
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
+/// A shader-visible view heap of `count` slots as the title makes one, with
+/// its memory our own (tests of what lists bind from it).
+#[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = HeapDesc {
+        kind: VIEWS_KIND,
+        count,
+        flags: SHADER_VISIBLE,
+        nodes: 0,
+    };
+    let none = Placement {
+        address: 0,
+        size: 0,
+    };
+    let extended = Extended(desc, none);
+    let mut out = std::ptr::null();
+    let made = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut out);
+    assert_eq!(made, object::S_OK);
+    out
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &HEAP_IIDS).then_some(this);
     object::answer(DESCRIPTOR_HEAP, iid, found, out)

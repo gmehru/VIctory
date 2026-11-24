@@ -12,6 +12,9 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
+//! A pipeline's rectangle pipeline ([`HostPipeline::rects`]) is made the
+//! same way, queued by its first rectangle draw ([`ready_rects`]).
+//!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
@@ -33,6 +36,17 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// Its rectangle pipeline, or why there is none, once made; whether it
+    /// is queued.
+    rects: OnceLock<Result<HostPipeline, &'static str>>,
+    rects_queued: AtomicBool,
+}
+
+/// What a worker makes of a pending pipeline.
+#[derive(Clone, Copy)]
+enum Job {
+    Pipeline,
+    Rects,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,12 +70,25 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            rects: OnceLock::new(),
+            rects_queued: AtomicBool::new(false),
         }
     }
 
-    fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    fn make(&self, job: Job) {
+        match job {
+            Job::Pipeline => {
+                self.made
+                    .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+            }
+            // Queued once the host pipeline is made ([`ready_rects`]).
+            Job::Rects => {
+                self.rects.get_or_init(|| match self.made.get() {
+                    Some(Some(p)) => p.rects(self.graphics.as_deref()),
+                    _ => Err(crate::rects::NO_HOST_PIPELINE),
+                });
+            }
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -109,8 +136,8 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
-        wait(p, crate::frame::current());
+        start(p, Job::Pipeline);
+        wait(|| p.made.get().is_some(), crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
@@ -119,11 +146,32 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     made
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::Relaxed) {
+/// The rectangle pipeline of `p` ([`HostPipeline::rects`]), once its host
+/// pipeline is made ([`ready`] first): queued on first use and waited for
+/// as [`ready`] does; while it is being made, or if it cannot be, why not
+/// (a drop reason).
+pub(crate) fn ready_rects(p: &Arc<Pending>) -> Result<&HostPipeline, &'static str> {
+    ready(p).ok_or(crate::rects::NO_HOST_PIPELINE)?;
+    if p.rects.get().is_none() {
+        start(p, Job::Rects);
+        wait(|| p.rects.get().is_some(), crate::frame::current());
+    }
+    match p.rects.get() {
+        Some(Ok(made)) => Ok(made),
+        Some(Err(why)) => Err(why),
+        None => Err("rectangles: being made"),
+    }
+}
+
+/// Queues `job` of `p` for the workers, once.
+fn start(p: &Arc<Pending>, job: Job) {
+    let queued = match job {
+        Job::Pipeline => &p.queued,
+        Job::Rects => &p.rects_queued,
+    };
+    if !queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
+        queue(p.clone(), job);
     }
 }
 
@@ -132,12 +180,12 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, Job::Pipeline);
     }
 }
 
-/// Waits for `p` while frame `frame` has budget left.
-fn wait(p: &Pending, frame: u64) {
+/// Waits until `done` while frame `frame` has budget left.
+fn wait(done: impl Fn() -> bool, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
@@ -145,24 +193,24 @@ fn wait(p: &Pending, frame: u64) {
     }
     let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
-    let (lock, done) = &DONE;
+    let (lock, signal) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while !done() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = signal.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
+/// Hands `job` of `p` to the workers (half the logical processors, 2 to 8),
+/// started on first use.
+fn queue(p: Arc<Pending>, job: Job) {
+    static SENDER: OnceLock<std::sync::mpsc::Sender<(Arc<Pending>, Job)>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
+        let (sender, receiver) = std::sync::mpsc::channel::<(Arc<Pending>, Job)>();
         let receiver = Arc::new(Mutex::new(receiver));
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
@@ -178,8 +226,8 @@ fn queue(p: Arc<Pending>) {
                     }
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
+                        let Ok((p, job)) = next else { return };
+                        p.make(job);
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -193,9 +241,10 @@ fn queue(p: Arc<Pending>) {
         }
         sender
     });
-    if let Err(e) = sender.send(p) {
+    if let Err(e) = sender.send((p, job)) {
         // No worker: made here instead.
-        e.0.make();
+        let (p, job) = e.0;
+        p.make(job);
         WAITING.fetch_sub(1, Ordering::Relaxed);
     }
 }

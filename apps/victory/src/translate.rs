@@ -182,6 +182,7 @@ pub fn run(
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
+    let only = crate::shader::only_from_env()?;
     let total = Mutex::new(Tally::default());
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -213,7 +214,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, entry.path(), &seen, only.as_ref(), &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -305,13 +306,33 @@ fn translate(
     source: &Source,
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
+    only: Option<&HashSet<String>>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        return t.fail("corrupt record".into(), || {
+            format!("{}{}", path.display(), source.label())
+        });
     };
+    // The runtime's name for a container: the start of its content hash.
+    let named = only.map(|only| match crate::shader::container_hash(&bytes) {
+        Some(whole) => {
+            let hash = whole.to_hex()[..16].to_owned();
+            (
+                crate::shader::wanted(only, &hash) && lock(seen).insert(whole),
+                hash,
+            )
+        }
+        None => (false, String::new()),
+    });
+    let example = || match &named {
+        Some((_, hash)) => format!("{}{} #{hash}", path.display(), source.label()),
+        None => format!("{}{}", path.display(), source.label()),
+    };
+    if matches!(named, Some((false, _))) {
+        return;
+    }
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -319,7 +340,7 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    if named.is_none() && !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
         return;
     }
@@ -329,7 +350,9 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+        // As `emit::translate` builds it (the spill table switch).
+        let spilled = emit::reads_spill_table(&p);
+        match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, spilled) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
@@ -562,6 +585,11 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
             }
             resource::Source::Constant(_) => {
                 t.constant += 1;
+                None
+            }
+            // Named by what the code copies around: no one address.
+            resource::Source::Held { .. } => {
+                t.loaded += 1;
                 None
             }
             resource::Source::Phi { .. }

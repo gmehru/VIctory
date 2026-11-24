@@ -117,7 +117,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_CAPTURE_AFTER=3,8,15` | with `VICTORY_CAPTURE`, also the frames that many after the first world frame (the first after whose previous present at least 200 draws were recorded; logged as `first world frame`; offset 0 saves its picture only) |
+| `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and one of the two lists above, saves every render target of the listed frames (largest first; none under 32x32; a frame's dumps stop after 15 s; logged as `targets dumped`) |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
@@ -125,6 +126,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_RECT_GS=0` | rectangle-list draws no longer go through the geometry shader that adds each rectangle's fourth corner (on by default: indirect and indexed ones, and direct ones of pipelines that read no vertex buffer or the vertex id; needs `dxcompiler.dll` and `dxil.dll` from a Windows SDK, found as the validator's `dxil.dll` is, else these draws stay dropped); they run as before it: indirect and indexed ones dropped, direct ones expanded on the CPU. The frame statistics count them (`rectangle draws through the geometry shader`) |
+| `VICTORY_INDIRECT_RECTS=1` | with `VICTORY_RECT_GS=0` (so only in a diagnostics build), runs indirect rectangle-list draws, expanded on the CPU, instead of dropping them; pipelines that read no vertex buffer or the vertex id stay dropped (`rectangles: no vertex input`, `rectangles: vertex-id pipeline`) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

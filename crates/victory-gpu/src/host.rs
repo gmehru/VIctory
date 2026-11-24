@@ -61,6 +61,52 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
+/// A host resource waiting to be dropped after in-flight GPU work finishes.
+struct Retired {
+    frame: u64,
+    #[allow(dead_code)]
+    resource: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded and may be released on any thread.
+unsafe impl Send for Retired {}
+
+/// Host resources retired on worker threads (for example when a descriptor
+/// slot is overwritten or a title resource is released while a submission is
+/// executing on the GPU). Kept alive for several presented frames because a
+/// single title frame spans many submissions and worker threads may record
+/// lists ahead of presentation.
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
+
+/// Holds `resource` alive until several full frames have completed on the GPU.
+pub(crate) fn retire(resource: ID3D12Resource) {
+    let frame = crate::queue::presented();
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Retired { frame, resource });
+}
+
+/// Ages are in frames presented to the host (not the title's 60 Hz clock, which
+/// ticks many times per frame while the host runs at 1-2 fps).
+/// Takes retired resources old enough to drop once the current submission
+/// finishes on the GPU.
+fn take_retired() -> Vec<Retired> {
+    const KEEP_FRAMES: u64 = 16; // experiment: 4 lost the device after about 70 s, 16 after 5 to 8 min
+    let now = crate::queue::presented();
+    let mut guard = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < guard.len() {
+        if now.saturating_sub(guard[i].frame) >= KEEP_FRAMES {
+            ready.push(guard.swap_remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ready
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -252,6 +298,45 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    /// Device-removed reports find lists and their preludes by name.
+    #[test]
+    fn lists_are_found_by_name() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        assert_ne!(a.serial, b.serial);
+        let runs = [&a, &b];
+        assert_eq!(find_list(&runs, &list_name(b.serial, false)), Some((1, false)));
+        assert_eq!(find_list(&runs, &list_name(a.serial, true)), Some((0, true)));
+        assert_eq!(find_list(&runs, "list scratch"), None);
+        a.close();
+        b.close();
+    }
+
+    /// Scratch memory for a view starts on a multiple of its alignment in
+    /// its buffer, and what the list takes next lies past it.
+    #[test]
+    fn scratch_views_start_aligned() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let list = host.new_list().unwrap();
+        let (start, cpu) = list.scratch(100).unwrap();
+        let (buffer, offset, at) = list.scratch_view(2044, 8176).unwrap();
+        // SAFETY: a live buffer.
+        let base = unsafe { buffer.GetGPUVirtualAddress() };
+        // The chunk in use, from its start: the first 256 bytes are taken.
+        assert_eq!((base, offset), (start, 8176));
+        assert_eq!(at as usize - cpu as usize, 8176);
+        let (next, _) = list.scratch(1).unwrap();
+        assert!(next >= base + offset + 2044);
+        // Larger than a chunk: a buffer of its own, from its start.
+        let (_, offset, _) = list.scratch_view(SCRATCH_CHUNK, 16).unwrap();
+        assert_eq!(offset, 0);
+        list.close();
+    }
+
     #[test]
     fn warp_adapter_accepts_only_software() {
         // This probes DXGI without creating a D3D12 device or running a title.
@@ -287,6 +372,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Memory shaders write indirect arguments to, reused after a reset.
+    arguments: Mutex<Arguments>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -309,6 +396,70 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// The list's number, in its and its prelude's debug names
+    /// ([`list_name`]).
+    serial: u64,
+}
+
+/// The debug name of host list number `serial`, or of its prelude. The
+/// device-removed report finds the lists its breadcrumbs name by it: their
+/// list pointers are the runtime's own objects, never ours with the debug
+/// layer on (it wraps them).
+fn list_name(serial: u64, prelude: bool) -> String {
+    if prelude {
+        format!("host list {serial} prelude")
+    } else {
+        format!("host list {serial}")
+    }
+}
+
+/// The list of `runs` named `name` ([`list_name`]): its index, and whether
+/// the name is its prelude's.
+fn find_list(runs: &[&HostList], name: &str) -> Option<(usize, bool)> {
+    runs.iter().enumerate().find_map(|(i, r)| {
+        if name == list_name(r.serial, false) {
+            Some((i, false))
+        } else if name == list_name(r.serial, true) {
+            Some((i, true))
+        } else {
+            None
+        }
+    })
+}
+
+/// Which list of `runs` a breadcrumb node is (its index, and whether it is
+/// that list's prelude), with how the report names it: by its debug name
+/// ([`list_name`]), else by pointer (which matches only without the debug
+/// layer).
+///
+/// # Safety
+///
+/// `node` is the runtime's, read while the device lives.
+unsafe fn node_list(
+    runs: &[&HostList],
+    node: &D3D12_AUTO_BREADCRUMB_NODE,
+) -> (Option<(usize, bool)>, String) {
+    let named = node.pCommandListDebugNameW;
+    // SAFETY: the runtime's NUL-terminated name, if any.
+    let name = (!named.is_null())
+        .then(|| unsafe { named.to_string() }.ok())
+        .flatten();
+    let found = match &name {
+        Some(name) => find_list(runs, name),
+        None => {
+            let ours = node.pCommandList.as_ref().map(|l| l.as_raw());
+            runs.iter()
+                .position(|r| Some(r.list.as_raw()) == ours)
+                .map(|i| (i, false))
+        }
+    };
+    let which = match (found, name) {
+        (Some((i, false)), _) => format!("list {i}"),
+        (Some((i, true)), _) => format!("prelude of list {i}"),
+        (None, Some(name)) => format!("{name:?}, not of this submission"),
+        (None, None) => "an unnamed list".into(),
+    };
+    (found, which)
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -364,6 +515,42 @@ struct Scratch {
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
+
+impl Scratch {
+    /// Takes `len` bytes (a multiple of 256, at most a chunk): from the
+    /// chunk in use, else from the next one (made if need be). The chunk's
+    /// index and the offset in it.
+    fn take(&mut self, len: u64) -> Option<(usize, u64)> {
+        if self.used + len > SCRATCH_CHUNK && self.current < self.chunks.len() {
+            (self.current, self.used) = (self.current + 1, 0);
+        }
+        if self.current == self.chunks.len() {
+            let (buffer, data) = host()?.upload_buffer(SCRATCH_CHUNK)?;
+            name(&buffer, || "list scratch".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.chunks.push((buffer, data as usize, gpu));
+            self.used = 0;
+        }
+        let at = self.used;
+        self.used += len;
+        Some((self.current, at))
+    }
+}
+
+/// Chunks of [`ARGUMENT_CHUNK`] bytes, the first `filled` in use, the last
+/// of them up to `used`.
+#[derive(Default)]
+struct Arguments {
+    chunks: Vec<ID3D12Resource>,
+    filled: usize,
+    used: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; used under the list's lock.
+unsafe impl Send for Arguments {}
+
+const ARGUMENT_CHUNK: u64 = 1 << 16;
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
 
@@ -451,6 +638,8 @@ impl Host {
 
     /// A new list, open for recording.
     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
         // SAFETY: plain object creation.
         unsafe {
             let allocator: ID3D12CommandAllocator = self
@@ -472,11 +661,15 @@ impl Host {
                 None,
             )?;
             prelude.Close()?;
+            // For the device-removed report (names only with it on).
+            name(&list, || list_name(serial, false));
+            name(&prelude, || list_name(serial, true));
             Ok(HostList {
                 allocator,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                arguments: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -485,6 +678,7 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                serial,
             })
         }
     }
@@ -510,6 +704,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        let retired = take_retired();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -574,6 +769,7 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        drop(retired);
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -664,9 +860,8 @@ impl Host {
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
-                progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
+                let (_, which) = node_list(runs, p);
+                progress.push(format!("{done}/{} {which}", p.BreadcrumbCount));
                 node = p.pNext;
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
@@ -676,12 +871,15 @@ impl Host {
                 if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                    let (found, which) = node_list(runs, p);
                     text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
+                        "; a list stopped at command {done} of {} (op {}): {which} of {}",
+                        p.BreadcrumbCount,
+                        history[done as usize].0,
+                        runs.len()
                     ));
-                    let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    // A prelude holds barriers only: no markers, no pipelines.
+                    let run = found.and_then(|(i, prelude)| (!prelude).then(|| runs[i]));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -889,6 +1087,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut arguments = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+            (arguments.filled, arguments.used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1079,32 +1281,49 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
+            let (buffer, data) = self.scratch_buffer(len)?;
             // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some((unsafe { buffer.GetGPUVirtualAddress() }, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
-            (s.current, s.used) = (s.current + 1, 0);
-        }
-        if s.current == s.chunks.len() {
-            let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-            name(&buffer, || "list scratch".into());
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            s.chunks.push((buffer, data as usize, gpu));
-            s.used = 0;
-        }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let (chunk, at) = s.take(len)?;
+        let (_, data, gpu) = s.chunks[chunk];
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// As [`HostList::scratch`], for a buffer view of the memory: `len`
+    /// bytes at an offset in their buffer that is a multiple of `align` (a
+    /// view starts on one of its elements; up to `align` more bytes are
+    /// taken to get there). The buffer, that offset in it and the CPU
+    /// pointer.
+    pub(crate) fn scratch_view(
+        &self,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (len, align) = (len.max(1), align.max(1));
+        // An aligned offset lies fewer than `align` bytes past any.
+        let room = (len + align).next_multiple_of(256);
+        if room > SCRATCH_CHUNK {
+            let (buffer, data) = self.scratch_buffer(len.next_multiple_of(256))?;
+            return Some((buffer, 0, data));
+        }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let (chunk, at) = s.take(room)?;
+        let (buffer, data, _) = &s.chunks[chunk];
+        let offset = at.next_multiple_of(align);
+        Some((buffer.clone(), offset, (data + offset as usize) as *mut u8))
+    }
+
+    /// Scratch memory larger than a chunk: a buffer of its own, kept until
+    /// the list is reset.
+    fn scratch_buffer(&self, len: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let (buffer, data) = host()?.upload_buffer(len)?;
+        name(&buffer, || format!("list scratch {len:#x}"));
+        self.deferred().uploads.push(buffer.clone());
+        Some((buffer, data))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1128,6 +1347,38 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The indirect work charged to the budget so far, once the list ran
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn budget_spent(&self) -> Option<u32> {
+        let (_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: the list's own mapped word.
+        Some(unsafe { (*data as *const u32).read_volatile() })
+    }
+
+    /// `len` bytes (at most 64 KiB) the list's shaders write and its
+    /// indirect executions read: a buffer and the offset in it, the list's
+    /// until it is reset. The buffer starts each submission in the common
+    /// state.
+    pub(crate) fn argument_space(&self, len: u64) -> Option<(ID3D12Resource, u64)> {
+        if len > ARGUMENT_CHUNK {
+            return None;
+        }
+        let mut a = self.arguments.lock().unwrap_or_else(|e| e.into_inner());
+        if a.filled == 0 || a.used + len > ARGUMENT_CHUNK {
+            if a.filled == a.chunks.len() {
+                let (buffer, _) = host()?.shared_buffer(ARGUMENT_CHUNK)?;
+                name(&buffer, || "indirect arguments".into());
+                a.chunks.push(buffer);
+            }
+            a.filled += 1;
+            a.used = 0;
+        }
+        let at = a.used;
+        a.used += len.next_multiple_of(16);
+        Some((a.chunks[a.filled - 1].clone(), at))
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -1525,6 +1776,8 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        #[cfg(feature = "diagnostics")]
+        let rects = crate::draw::take_rects();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
@@ -1542,6 +1795,69 @@ impl Meter {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames
+                    );
+                }
+                // Buffer views whose buffer does not start on one of their
+                // elements in its host copy, made since the last line.
+                let (copied, null): (Vec<_>, Vec<_>) = crate::descriptor::host::take_unplaced()
+                    .into_iter()
+                    .map(|(kind, element, n)| (kind, format!("{kind} element={element} x {n}")))
+                    .partition(|(kind, _)| *kind == crate::descriptor::host::COPIED);
+                for (views, what) in [(null, "left null"), (copied, "read from copies")] {
+                    if !views.is_empty() {
+                        let views: Vec<String> = views.into_iter().map(|(_, v)| v).collect();
+                        tracing::info!("buffer views {what} since the last line: {}", views.join(", "));
+                    }
+                }
+                // Root shader views bound as raw views in dynamic slots
+                // (`draw::BOUNDED_ROOT_SRVS`), and the draws dropped for
+                // want of one. A view without a free slot is also counted
+                // by the heap among the tables not made (next line).
+                let [made, no_heap, no_slot, misaligned] = crate::draw::take_root_srvs();
+                if made + no_heap + no_slot + misaligned > 0 {
+                    tracing::info!(
+                        made,
+                        dropped_without_heap = no_heap,
+                        dropped_without_slot = no_slot,
+                        dropped_off_16_bytes = misaligned,
+                        "root shader views since the last line: views made (bounded, in dynamic \
+                         slots), draws dropped without a host view heap bound, draws dropped \
+                         without a free dynamic slot (also among the tables not made), draws \
+                         dropped with the view not on 16 bytes in its host copy"
+                    );
+                }
+                let tables = crate::descriptor::host::take_not_made();
+                if tables > 0 {
+                    tracing::info!(
+                        tables,
+                        "tables not made since the last line: no free dynamic descriptor slots \
+                         (their draws dropped; root shader views without a slot included)"
+                    );
+                }
+                // Rectangle-list draws through the geometry shader
+                // (`rects`), over the same frames as the drops.
+                let ([ran, not_run], whys) = &rects;
+                if ran + not_run > 0 {
+                    let per_frame = |n: u64| n as f64 / frames;
+                    let whys: Vec<String> = whys
+                        .iter()
+                        .map(|(why, n)| format!("{why} {:.1}", per_frame(*n)))
+                        .collect();
+                    tracing::info!(
+                        "rectangle draws through the geometry shader: {:.1}/frame drawn, \
+                         {:.1}/frame dropped [{}]",
+                        per_frame(*ran),
+                        per_frame(*not_run),
+                        whys.join(", ")
+                    );
+                }
+                let [constant, shader] = crate::draw::take_short_roots();
+                if constant + shader > 0 {
+                    tracing::info!(
+                        constant_buffers = constant,
+                        shader_resources = shader,
+                        "root views bound since the last line with less than 64 KiB (constant \
+                         buffers) or 1 MiB (shader resources) left in their buffer's host copy"
                     );
                 }
             }

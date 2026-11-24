@@ -76,6 +76,38 @@ pub enum Source {
         block: usize,
         args: Vec<Option<Source>>,
     },
+    /// A sampler the code keeps in four VGPRs and takes back from the
+    /// first active lane (`v_readfirstlane_b32` of each dword) before the
+    /// use, in a loop that runs once per distinct descriptor among the
+    /// lanes: the console compiler's form of a sampler that may differ
+    /// from lane to lane. The VGPRs are reused, and hold other things in
+    /// lanes and on paths where no sampler is live.
+    ///
+    /// The descriptor's dwords have no host value, and need none: the
+    /// translation gives each copy into the VGPRs (`copies`) the sampler's
+    /// heap index, a tag and zeros instead, which flow like the dwords
+    /// would, compare equal exactly where one heap slot is meant, and name
+    /// the sampler at the use (`words`, checked against the tag). The
+    /// lowering takes it only where every read-back (`backs`) is such a
+    /// loop's ([`Waterfall`]): those it lowers as each lane's own dwords, so
+    /// each lane samples with its own sampler.
+    Held {
+        /// The values the use reads as dwords 0 and 1.
+        words: [Value; 2],
+        /// The `v_readfirstlane_b32` results the four dwords are.
+        backs: [Value; 4],
+        /// Every `v_mov_b32` that copies a dword of a loaded descriptor
+        /// into those VGPRs, on any path: the copy, the load, the
+        /// descriptor's first dword in the load, the dword copied (0-3).
+        copies: Vec<(Site, Site, u8, u8)>,
+        /// The VGPR values the four dwords are taken back from.
+        vgprs: [Value; 4],
+        /// Every instruction that puts a constant into one of those VGPRs
+        /// (the dword it would be), on any path: four of them in one
+        /// place, still there at the use, could be an immediate sampler,
+        /// which this is not for.
+        constants: Vec<(Site, u8)>,
+    },
 }
 
 impl Source {
@@ -116,6 +148,14 @@ pub struct Resources {
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// The scalar accesses of [`Self::scalar`] by the address they name:
+    /// two with the same number read the same memory. Their addresses are
+    /// the same parameter and constant, and computed terms of the same
+    /// form: the same value, or the same operations on the same values,
+    /// where each `v_readfirstlane_b32` of one VGPR value counts as one
+    /// value (the index the shader's lanes share; the console compiler
+    /// loads a heap descriptor again for each use of it).
+    pub same: Vec<(Site, u32)>,
     pub waterfall: Waterfall,
 }
 
@@ -179,7 +219,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, role, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
@@ -239,6 +279,20 @@ pub fn track(
             }
         }
     }
+    let mut shapes = Shapes::default();
+    let mut classes: Vec<(usize, u32, Option<u32>)> = Vec::new();
+    for &(site, a) in &out.scalar {
+        let key = (
+            a.param,
+            a.offset,
+            a.dynamic.map(|d| t.shape(Term::Value(d), &mut shapes, 0)),
+        );
+        let class = classes.iter().position(|c| *c == key).unwrap_or_else(|| {
+            classes.push(key);
+            classes.len() - 1
+        });
+        out.same.push((site, class as u32));
+    }
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -269,6 +323,43 @@ pub fn track(
     }
     Ok(out)
 }
+
+/// What a computed address term is made of, for [`Resources::same`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Shape {
+    Const(u32),
+    /// Nothing looked into: equal only to itself.
+    Value(Value),
+    /// `v_readfirstlane_b32` of this VGPR value.
+    FirstLane(Value),
+    /// A scalar operation that only depends on its two sources, by name.
+    Op(&'static str, [u32; 2]),
+}
+
+/// Interned [`Shape`]s: equal shapes have equal numbers.
+#[derive(Default)]
+struct Shapes(std::collections::HashMap<Shape, u32>);
+
+/// Scalar operations whose result is a function of their two sources.
+const PURE: &[&str] = &[
+    "s_add_u32",
+    "s_add_i32",
+    "s_sub_u32",
+    "s_sub_i32",
+    "s_mul_i32",
+    "s_and_b32",
+    "s_or_b32",
+    "s_xor_b32",
+    "s_lshl_b32",
+    "s_lshr_b32",
+    "s_ashr_i32",
+    "s_bfe_u32",
+    "s_lshl1_add_u32",
+    "s_lshl2_add_u32",
+    "s_lshl3_add_u32",
+    "s_lshl4_add_u32",
+];
+const MAX_SHAPE_DEPTH: usize = 8;
 
 /// A dword after copy propagation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +532,36 @@ impl<'a> Tracer<'a> {
             Operand::Literal(x) => Some(Term::Const(x)),
             _ => None,
         }
+    }
+
+    /// The number of `t`'s [`Shape`].
+    fn shape(&self, t: Term, shapes: &mut Shapes, depth: usize) -> u32 {
+        let shape = match t {
+            Term::Const(c) => Shape::Const(c),
+            Term::Value(v) if depth >= MAX_SHAPE_DEPTH => Shape::Value(v),
+            Term::Value(v) => {
+                if let Some(first) = self.first_lane(v) {
+                    match first {
+                        Term::Const(c) => Shape::Const(c),
+                        Term::Value(x) => Shape::FirstLane(x),
+                    }
+                } else if let Some((inst, [a, b])) = self.sop2(v, PURE) {
+                    let a = self.shape(a, shapes, depth + 1);
+                    let b = self.shape(b, shapes, depth + 1);
+                    Shape::Op(inst.name(), [a, b])
+                } else {
+                    Shape::Value(v)
+                }
+            }
+        };
+        let next = shapes.0.len() as u32;
+        *shapes.0.entry(shape).or_insert(next)
+    }
+
+    /// The VGPR value (through copies) a plain `v_readfirstlane_b32`
+    /// writing `v` reads.
+    fn first_lane(&self, v: Value) -> Option<Term> {
+        self.first_lane_source(v).map(|x| self.vorigin(x))
     }
 
     /// Layout index and dword of the root parameter `reg` holds on entry.
@@ -762,7 +883,13 @@ impl<'a> Tracer<'a> {
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    fn descriptor(
+        &self,
+        inst: &Inst,
+        op: &Operand,
+        role: Role,
+        at: usize,
+    ) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -772,7 +899,248 @@ impl<'a> Tracer<'a> {
             .ok_or("a descriptor not in SGPRs")?;
         // Only the lanes that reach the access read the descriptor.
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        let traced = self.classify(&words, &mut Vec::new(), &mut known);
+        // A sampler read back from the first lane of VGPRs that scalars
+        // were copied into, where the registers hold other things in lanes
+        // and on paths that per-lane tracing cannot follow, is followed as
+        // held there ([`Self::held`]): that is right whichever lanes each
+        // copy ran in.
+        if traced.is_err()
+            && role == Role::Sampler
+            && let Some(held) = self.held(inst, code, dwords)
+        {
+            return Ok(held);
+        }
+        traced
+    }
+
+    /// [`Source::Held`] for the descriptor `inst` reads from `dwords`
+    /// SGPRs at `code`, if that is what it is. Refused (`None`) unless:
+    /// each dword is a plain `v_readfirstlane_b32`, all four in one block
+    /// under one EXEC (one lane's descriptor); everything that may have
+    /// reached the VGPRs is followed ([`Self::given`]); a loaded dword gets
+    /// there by `v_mov_b32` only; and the values read back go nowhere but
+    /// into equality compares and sampler operands, so that what stands in
+    /// for the dwords is never taken for them.
+    // shortcut: vector code is taken never to compute with a sampler's
+    // dwords while they are in the VGPRs (HLSL cannot say that, and the
+    // compiler only copies and compares them there); the registers'
+    // other contents make this impossible to check.
+    fn held(&self, inst: &Inst, code: u8, dwords: u8) -> Option<Source> {
+        if dwords != 4 {
+            return None;
+        }
+        let mut read = Vec::new();
+        let mut copies = Vec::new();
+        let mut first = None;
+        let mut constants = Vec::new();
+        let mut vgprs = Vec::new();
+        for k in 0..4u8 {
+            let raw = inst.read(Reg::S(code + k))?;
+            let Term::Value(s) = self.origin(raw) else {
+                return None;
+            };
+            let take = self.def(s).filter(|_| self.first_lane(s).is_some())?;
+            let at = (
+                self.defs[s.0 as usize]?.0,
+                take.read(Reg::S(crate::ir::EXEC)),
+            );
+            if *first.get_or_insert(at) != at {
+                return None;
+            }
+            let Fields::Valu(f) = &take.fields else {
+                return None;
+            };
+            let Some(&Operand::Vector { reg, .. }) = f.src.first() else {
+                return None;
+            };
+            let vgpr = take.read(Reg::V(reg))?;
+            vgprs.push(vgpr);
+            for (copy, plain, term) in self.given(vgpr)? {
+                let Term::Value(v) = term else {
+                    constants.push((copy, k));
+                    continue;
+                };
+                let Some(load) = self.defs[v.0 as usize] else {
+                    continue;
+                };
+                let li = self.inst(load);
+                if !li.name().starts_with("s_load_dword") {
+                    continue;
+                }
+                let at = li.writes.iter().position(|w| w.1 == v)? as u8;
+                // Dword k of a descriptor is dword k of some group of four.
+                if at % 4 != k {
+                    continue;
+                }
+                if !plain {
+                    return None;
+                }
+                copies.push((copy, load, at - k, k));
+            }
+            read.push((raw, s));
+        }
+        if !self.only_compared(read.iter().map(|r| r.1).collect()) {
+            return None;
+        }
+        Some(Source::Held {
+            words: [read[0].0, read[1].0],
+            backs: [read[0].1, read[1].1, read[2].1, read[3].1],
+            copies,
+            vgprs: vgprs.try_into().ok()?,
+            constants,
+        })
+    }
+
+    /// Every scalar that may have reached VGPR value `v`, with the
+    /// instruction that put it there and whether that is a plain
+    /// `v_mov_b32`: what `v_mov_b32`, `v_cndmask_b32` and `v_writelane_b32`
+    /// copy from SGPRs and constants, on any path and in any lane (a write
+    /// leaves the lanes outside EXEC what they held). `None` if something
+    /// may reach it that is not followed.
+    fn given(&self, v: Value) -> Option<Vec<(Site, bool, Term)>> {
+        let mut given: Vec<(Site, bool, Term)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![v];
+        while let Some(v) = todo.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                todo.extend(&self.p.blocks[b].phis[i].args);
+                continue;
+            }
+            // On entry: a system value or nothing.
+            let Some(site) = self.defs[v.0 as usize] else {
+                continue;
+            };
+            let inst = self.inst(site);
+            let &(Reg::V(reg), _) = inst.writes.iter().find(|w| w.1 == v)? else {
+                return None;
+            };
+            // The lanes the instruction does not write.
+            todo.push(inst.read(Reg::V(reg))?);
+            // A modifier changes the bits (a negation flips the top one): a
+            // VGPR read that way is computed with, not copied, and a scalar
+            // is no plain copy.
+            let mut passed = |op: &Operand, plain: bool, modified: bool, todo: &mut Vec<Value>| {
+                match *op {
+                    Operand::Vector { .. } if modified => {}
+                    Operand::Vector { reg, .. } => todo.push(inst.read(Reg::V(reg))?),
+                    op => {
+                        let g = (site, plain && !modified, self.term(inst, &op)?);
+                        if !given.contains(&g) {
+                            given.push(g);
+                        }
+                    }
+                }
+                Some(())
+            };
+            match (&inst.fields, inst.name()) {
+                (Fields::Valu(f), "v_mov_b32" | "v_cndmask_b32") if f.sdwa.is_none() => {
+                    let modified = f.abs != 0 || f.neg != 0 || f.clamp || f.omod != 0;
+                    if inst.name() == "v_mov_b32" {
+                        passed(f.src.first()?, f.dpp.is_none(), modified, &mut todo)?;
+                    } else {
+                        passed(f.src.first()?, false, modified, &mut todo)?;
+                        passed(f.src.get(1)?, false, modified, &mut todo)?;
+                    }
+                }
+                (Fields::Valu(f), "v_writelane_b32") => {
+                    passed(f.src.first()?, false, false, &mut todo)?;
+                }
+                // Moves between registers by index.
+                (Fields::Valu(_), name) if name == "v_swap_b32" || name.contains("rel") => {
+                    return None;
+                }
+                // Arithmetic, interpolation, and what a buffer, an image or
+                // LDS holds are no scalar's copy.
+                (
+                    Fields::Valu(_)
+                    | Fields::Vintrp { .. }
+                    | Fields::Buffer { .. }
+                    | Fields::Image { .. }
+                    | Fields::Ds { .. },
+                    _,
+                ) => {}
+                // So is what a global load reads from the code's constant
+                // table or through a root view; descriptors live elsewhere
+                // (a heap or a table), and such a load is not followed.
+                (
+                    Fields::Flat {
+                        addr,
+                        saddr,
+                        offset,
+                        ..
+                    },
+                    name,
+                ) if name.starts_with("global_load_") => {
+                    let a = self
+                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .ok()?;
+                    let data =
+                        a.param == CODE || self.layout.get(a.param)?.root == RootType::Descriptor;
+                    if !data {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(given)
+    }
+
+    /// Whether the scalar values `held` (and their copies and joins) are
+    /// read by nothing but equality compares and, as a sampler, image
+    /// instructions.
+    fn only_compared(&self, mut held: Vec<Value>) -> bool {
+        loop {
+            let before = held.len();
+            for block in &self.p.blocks {
+                for phi in &block.phis {
+                    if phi.args.iter().any(|a| held.contains(a)) && !held.contains(&phi.value) {
+                        held.push(phi.value);
+                    }
+                }
+                for inst in &block.insts {
+                    for &(reg, v) in &inst.reads {
+                        if !held.contains(&v) {
+                            continue;
+                        }
+                        let Reg::S(code) = reg else { return false };
+                        let name = inst.name();
+                        let ok = match &inst.fields {
+                            Fields::Image {
+                                sampler:
+                                    Some(Operand::Scalar {
+                                        code: first,
+                                        dwords,
+                                    }),
+                                ..
+                            } => (*first..*first + *dwords).contains(&code),
+                            Fields::Valu(_) => ["v_cmp_eq_u", "v_cmp_ne_u", "v_cmpx_eq_u"]
+                                .iter()
+                                .any(|p| name.starts_with(p)),
+                            Fields::Sop { .. } if name == "s_mov_b32" || name == "s_mov_b64" => {
+                                for &(_, w) in &inst.writes {
+                                    if !held.contains(&w) {
+                                        held.push(w);
+                                    }
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        if !ok {
+                            return false;
+                        }
+                    }
+                }
+            }
+            if held.len() == before {
+                return true;
+            }
+        }
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
@@ -1869,10 +2237,13 @@ pub(crate) mod tests {
 
     #[test]
     fn spilled_sgprs_are_followed_through_vgpr_lanes() {
+        // v0 is read as a vector too, so `ir::build` leaves the store and
+        // the reload in place.
         let r = track_words(
             &[
                 0xD761_0000,
                 0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0x7E06_0300, // v_mov_b32 v3, v0
                 0xD760_0002,
                 0x0001_0700, // v_readlane_b32 s2, v0, 3
                 0xBE83_0380, // s_mov_b32 s3, 0
@@ -1883,7 +2254,129 @@ pub(crate) mod tests {
             &[param(Table, 9, 1)],
             HwStage::Ps,
         );
-        assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+        assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
+    }
+
+    #[test]
+    fn loads_of_one_address_are_told_from_others() {
+        let r = track_words(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0x7E00_0500, // v_readfirstlane_b32 s0, v0
+                0x8F00_8500, // s_lshl_b32 s0, s0, 5
+                0xF408_0101,
+                0x0000_0000, // s_load_dwordx4 s[4:7], s[2:3], s0
+                0x7E02_0500, // v_readfirstlane_b32 s1, v0
+                0x8F01_8501, // s_lshl_b32 s1, s1, 5
+                0xF408_0101,
+                0x0200_0000, // s_load_dwordx4 s[4:7], s[2:3], s1
+                0x8F01_8601, // s_lshl_b32 s1, s1, 6
+                0xF408_0101,
+                0x0200_0000, // s_load_dwordx4 s[4:7], s[2:3], s1
+                0xF408_0101,
+                0xFA00_0010, // s_load_dwordx4 s[4:7], s[2:3], 0x10
+                S_ENDPGM,
+            ],
+            &[param(ResourceHeap, 9, 1)],
+            HwStage::Ps,
+        );
+        let class = |n: usize| r.same[n].1;
+        assert_eq!(r.same.len(), 4);
+        // The same index computed twice; then another index; then none.
+        assert_eq!(class(0), class(1));
+        assert_ne!(class(0), class(2));
+        assert_ne!(class(0), class(3));
+        assert_ne!(class(2), class(3));
+    }
+
+    /// A sampler loaded on one path and copied into v4-v7, taken back from
+    /// the first lane after the join; `other` runs on the other path and
+    /// `after` before the sample. Traced without the lanes' paths: with
+    /// them, the read-back outside a waterfall loop is refused (the
+    /// synthetic tests run held samplers in such loops).
+    fn sampler_in_vgprs(other: [u32; 3], after: u32) -> Result<Resources, ShaderError> {
+        let words = [
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBF06_0100, // s_cmp_eq_u32 s0, s1
+            0xBF85_0007, // s_cbranch_scc1 -> 0x2c
+            0xF408_0101,
+            0xFA00_0010, // s_load_dwordx4 s[4:7], s[2:3], 0x10
+            0x7E08_0204, // v_mov_b32 v4, s4
+            0x7E0A_0205, // v_mov_b32 v5, s5
+            0x7E0C_0206, // v_mov_b32 v6, s6
+            0x7E0E_0207, // v_mov_b32 v7, s7
+            0xBF82_0003, // s_branch -> 0x38
+            other[0],    // 0x2c
+            other[1],
+            other[2],
+            0x7E18_0504, // 0x38: v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            after,
+            0xF40C_0401,
+            0xFA00_0000, // s_load_dwordx8 s[16:23], s[2:3], null
+            0xF080_0F08,
+            0x0064_0002, // image_sample v[0:3], v[2:3], s[16:23], s[12:15]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, &[param(Table, 9, 1)], HwStage::Ps, None)
+    }
+
+    #[test]
+    fn a_sampler_taken_back_from_vgprs_is_held() {
+        const NOP: u32 = 0xBF80_0000;
+        // The other path leaves a sum and a constant in the registers.
+        // v_add_nc_u32 v4, 1, v0; v_mov_b32 v5, 0
+        let leftovers = [0x4A08_0081, 0x7E0A_0280, NOP];
+        let r = sampler_in_vgprs(leftovers, NOP).unwrap();
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
+        let Some(Source::Held {
+            copies, constants, ..
+        }) = sampler.map(|d| &d.source)
+        else {
+            panic!("{:?}", r.descriptors)
+        };
+        // The four copies, each dword of the descriptor at the load's start.
+        let load = (1, 0);
+        let want: Vec<_> = (0..4).map(|k| ((1, 1 + k as usize), load, 0, k)).collect();
+        assert_eq!(*copies, want);
+        assert_eq!(
+            r.scalar.iter().find(|s| s.0 == load).unwrap().1,
+            at(0, 0x10)
+        );
+        assert_eq!(*constants, [((2, 1), 1)]);
+
+        let unsupported = |r: Result<Resources, ShaderError>| {
+            assert!(
+                matches!(
+                    r,
+                    Err(ShaderError::Unsupported {
+                        what: "a descriptor read from the first lane of a phi, without the lanes' paths",
+                        ..
+                    })
+                ),
+                "{r:?}"
+            )
+        };
+        // A dword read back is computed with: what stands in for it is not it.
+        unsupported(sampler_in_vgprs(leftovers, 0x8018_0D0C)); // s_add_u32 s24, s12, s13
+        // A swap may bring a descriptor from registers that are not followed.
+        unsupported(sampler_in_vgprs([0x7E08_CB00, NOP, NOP], NOP)); // v_swap_b32 v4, v0
+        // A loaded dword that a select passes on is no copy: the other path
+        // loads the sampler too (s_load_dwordx4 s[4:7], s[2:3], 0x10) and
+        // selects its first dword into v4 (v_cndmask_b32 v4, s4, v0, vcc).
+        unsupported(sampler_in_vgprs(
+            [0xF408_0101, 0xFA00_0010, 0x0208_0004],
+            NOP,
+        ));
+        // The same select of s4 without the load passes on what s4 held on
+        // entry, a leftover like any other.
+        assert!(sampler_in_vgprs([0x0208_0004, NOP, NOP], NOP).is_ok());
     }
 
     #[test]

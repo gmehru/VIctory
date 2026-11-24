@@ -781,4 +781,55 @@ mod tests {
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
     }
+
+    /// Address dwords per GFX10's operand rules: a biased a16 sample has
+    /// the bias's dword then one of two f16 coordinates; a gather at a level
+    /// with offsets has offsets, u, v, level; a cube `_d_cl` four
+    /// derivatives, s, t, face, clamp. Derivatives stay 32-bit with a16
+    /// (a 2D `_d`: four, then the coordinate pair) and pack only in `_g16`
+    /// (two, then two 32-bit coordinates).
+    #[test]
+    fn image_address_dwords() {
+        let dwords = |words: &[u32]| -> u8 {
+            let code: Vec<u8> = words
+                .iter()
+                .chain(&[0xBF81_0000])
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let Fields::Image { addr, .. } = decode(&code).unwrap()[0].fields(true) else {
+                panic!("not an image instruction");
+            };
+            addr.iter()
+                .map(|a| match a {
+                    Operand::Vector { dwords, .. } => *dwords,
+                    _ => panic!("{a:?}"),
+                })
+                .sum()
+        };
+        let biased = [0xF094_0108, 0x4061_0102];
+        assert_eq!(
+            one(&biased, true),
+            "image_sample_b v1, v[2:3], s[4:11], s[12:15] dim:SQ_RSRC_IMG_2D a16"
+        );
+        assert_eq!(dwords(&biased), 2);
+        let gather = [0xF150_0108, 0x00C3_0804];
+        assert_eq!(
+            one(&gather, true),
+            "image_gather4_l_o v[8:11], v[4:7], s[12:19], s[24:27] dim:SQ_RSRC_IMG_2D"
+        );
+        assert_eq!(dwords(&gather), 4);
+        // NSA: v10 in dword 1, v11-v17 in the two extra dwords.
+        let cube = [0xF08C_071C, 0x0040_140A, 0x0E0D_0C0B, 0x0011_100F];
+        assert_eq!(
+            one(&cube, true),
+            "image_sample_d_cl v[20:22], [v10,v11,v12,v13,v14,v15,v16,v17], s[0:7], s[8:11] dmask:0x7 dim:SQ_RSRC_IMG_CUBE"
+        );
+        assert_eq!(dwords(&cube), 8);
+        // image_sample_d v1, v[0:4] a16; image_sample_d_g16 v1, v[0:3].
+        assert_eq!(dwords(&[0xF088_0108, 0x4000_0100]), 5);
+        assert_eq!(dwords(&[0xF088_0109, 0x0000_0100]), 4);
+        assert!(
+            one(&[0xF088_0109, 0x0000_0100], true).starts_with("image_sample_d_g16 v1, v[0:3]")
+        );
+    }
 }

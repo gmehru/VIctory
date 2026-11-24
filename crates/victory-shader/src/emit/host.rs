@@ -17,6 +17,27 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
+/// Private data of the root signatures [`Host::root_signature_for`] makes:
+/// a `u64` with a bit per root parameter that is a root SRV's table.
+const SRV_TABLES: windows::core::GUID =
+    windows::core::GUID::from_u128(0x6b1f3c2e_8d4a_4f71_9a35_2c7e51d0b9e4);
+
+/// The root parameters of `root` that are root SRVs' tables (bit per
+/// parameter); none for root signatures made elsewhere.
+#[cfg(test)]
+fn srv_tables(root: &ID3D12RootSignature) -> u64 {
+    let mut tables = 0u64;
+    let mut size = size_of::<u64>() as u32;
+    // SAFETY: room for the `u64` the data is, if there is any.
+    let found =
+        unsafe { root.GetPrivateData(&SRV_TABLES, &mut size, Some((&raw mut tables).cast())) };
+    if found.is_ok() && size == size_of::<u64>() as u32 {
+        tables
+    } else {
+        0
+    }
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
@@ -113,7 +134,8 @@ impl Host {
     }
 
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
+    /// parameter k, root views follow (root CBVs as root descriptors, root
+    /// SRVs as tables of one view, as victory-gpu binds them).
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -141,17 +163,60 @@ impl Host {
             .collect();
         views.sort_unstable();
         views.dedup();
+        // Root SRVs as the host binds them (victory-gpu, bounded root
+        // shader views): a table of one raw view at the same register,
+        // volatile so the driver cannot make it a root descriptor. The
+        // ranges are complete before any parameter points at them.
+        let ranges: Vec<D3D12_DESCRIPTOR_RANGE1> = views
+            .iter()
+            .filter(|v| v.1)
+            .map(|&(slot, _)| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                BaseShaderRegister: u32::from(slot),
+                RegisterSpace: super::ROOT_CBV_SPACE,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            })
+            .collect();
+        let mut tables = 0u64;
+        let mut range = ranges.iter();
         for (slot, srv) in views {
+            if srv && let Some(range) = range.next() {
+                // (A root signature has at most 64 parameters.)
+                tables |= 1u64.checked_shl(params.len() as u32).unwrap_or(0);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: range,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                continue;
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
-                },
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        if stages.iter().any(|(s, _)| s.stride_table) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::STRIDE_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -204,7 +269,16 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root: ID3D12RootSignature =
+                self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            // Which parameters are root SRVs' tables, for `Host::dispatch`.
+            root.SetPrivateData(
+                &SRV_TABLES,
+                size_of::<u64>() as u32,
+                Some((&raw const tables).cast()),
+            )
+            .map_err(err)?;
+            Ok(root)
         }
     }
 
@@ -528,6 +602,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        stride_table: false,
     }
 }
 
@@ -541,7 +616,10 @@ pub enum Root {
         index: usize,
     },
     /// A root CBV (or with `srv`, a root SRV) over a buffer of these
-    /// dwords ([`Host::dispatch`] only).
+    /// dwords ([`Host::dispatch`] only). A root SRV is bound as the root
+    /// signature has it: a root descriptor, or in one
+    /// [`Host::root_signature_for`] made, a table of one raw view of the
+    /// buffer.
     View {
         srv: bool,
         data: Vec<u32>,
@@ -910,20 +988,30 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F texture SRV with mip levels (width and height of level
+    /// 0, levels, the texels of each level in turn, halving to 1).
+    Levels(u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F 2D array SRV (width, height, layers, texels of each
+    /// layer in turn).
+    Layers(u32, u32, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
+    Uint64TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A null buffer SRV viewed so (one element named, none there).
+    NullBuffer(Stride),
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1018,7 +1106,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
+            // Texel words: 4 for RGBA32F, 2 for R32G32_UINT, 1 for R32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1027,10 +1115,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1071,7 +1159,19 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
+            // Root SRVs bound as tables (`root_signature_for`) get a raw view
+            // each in a slot past the heap's views.
+            let tables = srv_tables(root);
+            let is_table = |param: u32| tables.checked_shr(param).is_some_and(|t| t & 1 != 0);
+            let table_views = d
+                .roots
+                .iter()
+                .filter(|(param, r)| matches!(r, Root::View { srv: true, .. }) && is_table(*param))
+                .count();
+            let views = heap(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                d.views.len() + table_views,
+            )?;
             let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
@@ -1085,21 +1185,28 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                    View::Texture(..) | View::Cube(..) | View::Levels(..) | View::Layers(..) => {
+                        let (w, h, texels, faces, levels) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, t) => (n, n, t, 6, 1),
+                            View::Levels(w, h, n, t) => (w, h, t, 1, n),
+                            View::Layers(w, h, n, t) => (w, h, t, n, 1),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = levels as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        // Subresources in order: each face's levels.
+                        let mut texels = texels;
+                        for sub in 0..faces * levels {
+                            let (w, h) =
+                                ((w >> (sub % levels)).max(1), (h >> (sub % levels)).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1107,7 +1214,6 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
                             for y in 0..h as usize {
                                 let row = &texels[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
@@ -1116,11 +1222,12 @@ impl Host {
                                     row.len() * 16,
                                 );
                             }
+                            texels = &texels[(w * h) as usize..];
                             upload.Unmap(0, None);
-                            let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            let mut at_sub = subresource(&tex);
+                            at_sub.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
-                                &at_face,
+                                &at_sub,
                                 0,
                                 0,
                                 0,
@@ -1145,11 +1252,24 @@ impl Host {
                                 },
                             },
                         };
-                        dev.CreateShaderResourceView(
-                            &tex,
-                            (faces == 6).then_some(&cube as *const _),
-                            at,
-                        );
+                        let layers = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                                    MipLevels: 1,
+                                    ArraySize: faces,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let desc = match *v {
+                            View::Cube(..) => Some(&cube as *const _),
+                            View::Layers(..) => Some(&layers as *const _),
+                            _ => None,
+                        };
+                        dev.CreateShaderResourceView(&tex, desc, at);
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {
@@ -1206,25 +1326,24 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h) | View::Uint64TextureUav(w, h) => {
+                        let (words, format) = match *v {
+                            View::Uint64TextureUav(..) => (2, DXGI_FORMAT_R32G32_UINT),
+                            _ => (1, DXGI_FORMAT_R32_UINT),
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4).next_multiple_of(256);
+                        let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), 1, rb));
+                        uavs.push((t, Some((w, h)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
@@ -1281,6 +1400,34 @@ impl Host {
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
                     }
+                    View::NullBuffer(stride) => {
+                        let (format, stride, flags) = match stride {
+                            Stride::Raw => (DXGI_FORMAT_R32_TYPELESS, 0, D3D12_BUFFER_SRV_FLAG_RAW),
+                            Stride::Typed => (
+                                DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_NONE,
+                            ),
+                            Stride::Structured(s) => {
+                                (DXGI_FORMAT_UNKNOWN, s, D3D12_BUFFER_SRV_FLAG_NONE)
+                            }
+                            Stride::Format(f, _) => (f, 0, D3D12_BUFFER_SRV_FLAG_NONE),
+                        };
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Buffer: D3D12_BUFFER_SRV {
+                                    FirstElement: 0,
+                                    NumElements: 1,
+                                    StructureByteStride: stride,
+                                    Flags: flags,
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+                    }
                 }
             }
             for (i, s) in d.samplers.iter().enumerate() {
@@ -1290,6 +1437,7 @@ impl Host {
             }
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
+            let mut table_slot = d.views.len();
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
@@ -1311,7 +1459,31 @@ impl Host {
                     Root::View { srv, data } => {
                         let b = upload(data)?;
                         let va = b.GetGPUVirtualAddress();
-                        if *srv {
+                        if *srv && is_table(*param) {
+                            // A raw view of the whole buffer, as the host
+                            // makes one from the address to the end of its
+                            // copy.
+                            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32_TYPELESS,
+                                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    Buffer: D3D12_BUFFER_SRV {
+                                        FirstElement: 0,
+                                        NumElements: (b.GetDesc().Width / 4) as u32,
+                                        StructureByteStride: 0,
+                                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                    },
+                                },
+                            };
+                            let mut at = views.GetCPUDescriptorHandleForHeapStart();
+                            at.ptr += table_slot * view_size;
+                            dev.CreateShaderResourceView(&b, Some(&desc), at);
+                            let mut table = views.GetGPUDescriptorHandleForHeapStart();
+                            table.ptr += (table_slot * view_size) as u64;
+                            table_slot += 1;
+                            list.SetComputeRootDescriptorTable(*param, table);
+                        } else if *srv {
                             list.SetComputeRootShaderResourceView(*param, va);
                         } else {
                             list.SetComputeRootConstantBufferView(*param, va);
@@ -1377,5 +1549,92 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A root SRV of a root signature [`Host::root_signature_for`] makes is
+    /// a table of one raw view at its register, as victory-gpu binds it,
+    /// and [`Host::dispatch`] binds a [`Root::View`] there so: the shader
+    /// reads the buffer's dwords, and zeros past its end. Needs the SDK's
+    /// `dxc.exe` (beside the `dxil.dll` the validator finds) and an SM 6.6
+    /// device; skipped without them.
+    #[test]
+    fn root_srvs_are_tables_of_one_raw_view() {
+        let Some(dxc) = super::super::validator::Validator::default_path()
+            .map(|p| p.with_file_name("dxc.exe"))
+            .filter(|p| p.exists())
+        else {
+            eprintln!("no SDK dxc.exe; skipped");
+            return;
+        };
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        const SOURCE: &str = r#"
+ByteAddressBuffer r : register(t4, space1);
+[numthreads(1, 1, 1)]
+void main() {
+    RWByteAddressBuffer o = ResourceDescriptorHeap[0];
+    uint n;
+    r.GetDimensions(n);
+    o.Store4(0, uint4(r.Load(0), r.Load(n - 4), n, r.Load(n)));
+}
+"#;
+        let dir = std::env::temp_dir().join(format!("victory-root-srv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (input, output) = (dir.join("t.hlsl"), dir.join("t.bin"));
+        std::fs::write(&input, SOURCE).unwrap();
+        let out = std::process::Command::new(&dxc)
+            .args(["-T", "cs_6_6", "-E", "main", "-Fo"])
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .unwrap();
+        let errors = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{errors}");
+        let dxil = std::fs::read(&output).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let cs = HostShader {
+            stage: crate::native::HwStage::Cs,
+            dxil,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: vec![4],
+            stride_table: false,
+        };
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        // The user data, then the root SRV's table.
+        assert_eq!(srv_tables(&root), 0b10);
+        // 256 bytes: the upload buffer's whole size.
+        let data: Vec<u32> = (0..64).map(|i| 0xa000_0000 | i).collect();
+        let got = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(vec![0])),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: data.clone(),
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        assert_eq!(got, [vec![data[0], data[63], 256, 0]]);
     }
 }
