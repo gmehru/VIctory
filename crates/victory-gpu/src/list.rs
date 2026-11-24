@@ -133,6 +133,19 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// Before a clear or copy of `resources`: those that are depth textures
+/// with a twin newer than them get its values first ([`crate::twin`]).
+#[cfg(windows)]
+fn sync_twins(this: This, resources: &[This]) {
+    if crate::twin::any_newer() {
+        with_state(this, |list, s| {
+            for &r in resources {
+                s.sync_twin(list, r);
+            }
+        });
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -327,11 +340,12 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
+        // Unordered access to a depth texture writes its twin.
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                crate::twin::barrier_texture(b.first).or_else(|| host(b.first))?
             },
             ..*b
         }),
@@ -474,9 +488,11 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
+            sync_twins(this, &[src, dst]);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
+            crate::twin::depth_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -538,6 +554,8 @@ extern "system" fn copy_texture_region(
             ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
             return;
         };
+        sync_twins(this, &[src.resource, dst.resource]);
+        crate::twin::depth_written(dst.resource);
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -777,6 +795,8 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        sync_twins(this, &[record.resource]);
+        crate::twin::depth_written(record.resource);
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
@@ -965,14 +985,12 @@ mod state {
         if let Some(list) = host_list(this) {
             crate::draw::viewports(list, items(viewports, count));
         }
-        #[cfg(feature = "diagnostics")]
         with_state(this, |_, s| s.note_viewports(items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
         if let Some(list) = host_list(this) {
             crate::draw::scissors(list, items(rects, count));
         }
-        #[cfg(feature = "diagnostics")]
         with_state(this, |_, s| s.note_scissors(items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {

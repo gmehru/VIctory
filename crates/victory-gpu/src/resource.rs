@@ -761,6 +761,9 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// A depth texture's colour twin, which unordered access views of it
+    /// write ([`crate::twin`]); made on the first such view.
+    pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
 }
 
 #[cfg(windows)]
@@ -948,6 +951,7 @@ fn hand_out_resource(
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                twin: std::sync::OnceLock::new(),
             })
         }),
     });

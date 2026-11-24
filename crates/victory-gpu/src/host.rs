@@ -1113,16 +1113,28 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        self.transition_copy(&copy, wanted)
+            .map(|before| (texture, before))
+    }
+
+    /// As [`HostList::transition`], for a host texture of ours (a title
+    /// texture's copy or its depth twin, [`crate::twin`]): the state it
+    /// leaves, if that is a change.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -1844,6 +1856,26 @@ impl Meter {
                          slots), draws dropped without a host view heap bound, draws dropped \
                          without a free dynamic slot (also among the tables not made), draws \
                          dropped with the view not on 16 bytes in its host copy"
+                    );
+                }
+                // Depth textures written through unordered access views
+                // (`twin`).
+                let [made, served, passes, stencil, stale, mismatched, refreshes] =
+                    crate::twin::take_stats();
+                if made + served + passes + stencil + stale + mismatched + refreshes > 0 {
+                    tracing::info!(
+                        made,
+                        served,
+                        passes,
+                        stencil,
+                        stale,
+                        mismatched,
+                        refreshes,
+                        "depth twins since the last line: twins made, unordered views served from \
+                         a twin, copy passes run (twin into depth), stencil-plane views left null, \
+                         stale-twin uses (written without the depth plane's newer values), views \
+                         of the other kind (float or integer) than their twin's left null, depth \
+                         planes copied into their twins"
                     );
                 }
                 let tables = crate::descriptor::host::take_not_made();

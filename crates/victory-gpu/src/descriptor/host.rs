@@ -630,6 +630,48 @@ impl HostHeap {
         self.set_stride(index, 4);
     }
 
+    /// Makes slot `index` (a dynamic one) shader view `desc` of `texture`
+    /// (a depth twin, [`crate::twin`]); the slot holds the texture while it
+    /// views it.
+    pub(crate) fn texture_srv_at(
+        &self,
+        index: u32,
+        texture: &ID3D12Resource,
+        desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    ) {
+        if let Some(host) = host() {
+            // SAFETY: a live texture and a slot of our heap.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(texture, Some(desc), self.cpu(index))
+            };
+        }
+        self.keep(index, Some(texture.clone()));
+        self.set_stride(index, 0);
+    }
+
+    /// As [`HostHeap::texture_srv_at`], for unordered access view `desc`.
+    pub(crate) fn texture_uav_at(
+        &self,
+        index: u32,
+        texture: &ID3D12Resource,
+        desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    ) {
+        if let Some(host) = host() {
+            // SAFETY: a live texture and a slot of our heap.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    texture,
+                    None::<&ID3D12Resource>,
+                    Some(desc),
+                    self.cpu(index),
+                )
+            };
+        }
+        self.keep(index, Some(texture.clone()));
+        self.set_stride(index, 0);
+    }
+
     /// The shader-visible handle of slot `index`, for a descriptor table
     /// starting there.
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
@@ -638,7 +680,7 @@ impl HostHeap {
         }
     }
 
-    fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    pub(crate) fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
@@ -1199,6 +1241,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
+            // Depth textures the host allows no unordered access to are
+            // written through their colour twin.
+            if let Some(twin) = crate::twin::unordered_view(resource, desc.as_ref(), at) {
+                return twin.map(Some);
+            }
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }

@@ -87,14 +87,17 @@ pub(crate) struct State {
     /// one each.
     root_views: std::collections::HashMap<(usize, u64, u64), u32>,
     /// The viewports, scissor rectangles and stencil reference last set on
-    /// the list (diagnostics: logged with the indirect executions of listed
-    /// frames; the host list gets them as the title sets them).
-    #[cfg(feature = "diagnostics")]
+    /// the list (logged with the indirect executions of listed frames in
+    /// diagnostics builds; set again after a depth twin's copy pass; the
+    /// host list gets them as the title sets them).
     viewports: Vec<D3D12_VIEWPORT>,
-    #[cfg(feature = "diagnostics")]
     scissors: Vec<RECT>,
     #[cfg(feature = "diagnostics")]
     stencil: u32,
+    /// The title's render target and depth view handles last set, set
+    /// again after a depth twin's copy pass ([`crate::twin`]).
+    target_handles: Vec<u64>,
+    depth_handle: u64,
 }
 
 impl Drop for State {
@@ -402,15 +405,14 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
-    /// Keeps the viewports the title set, to log them (diagnostics; the
-    /// host list gets them through [`viewports`]).
-    #[cfg(feature = "diagnostics")]
+    /// Keeps the viewports the title set, to log them (diagnostics) and set
+    /// them again after a depth twin's copy pass (the host list gets them
+    /// through [`viewports`]).
     pub(crate) fn note_viewports(&mut self, viewports: &[D3D12_VIEWPORT]) {
         self.viewports = viewports.to_vec();
     }
 
     /// As [`State::note_viewports`], for scissor rectangles.
-    #[cfg(feature = "diagnostics")]
     pub(crate) fn note_scissors(&mut self, rects: &[RECT]) {
         self.scissors = rects.to_vec();
     }
@@ -486,6 +488,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        self.target_handles = handles.to_vec();
+        self.depth_handle = depth;
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -586,6 +590,11 @@ impl State {
             );
             return false;
         }
+        // A depth target a shader wrote through its twin gets the twin's
+        // values first.
+        if self.depth != 0 {
+            self.sync_twin(list, self.depth as This);
+        }
         if !self.bind(list, p, false) {
             return false;
         }
@@ -638,6 +647,7 @@ impl State {
         }
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            crate::twin::depth_written(self.depth as This);
         }
         true
     }
@@ -686,6 +696,9 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made, or a root view it reads could not be bound.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if crate::twin::any_twins() {
+            self.sync_twins(list, p, compute);
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -827,6 +840,133 @@ impl State {
             }
         }
         true
+    }
+
+    /// Writes the twin of title depth texture `resource` into it if the
+    /// twin is newer ([`crate::twin::sync`]), then sets the title's state
+    /// again: the heaps stay the title's, the pipeline and root signature
+    /// are bound again by the next draw or dispatch, targets, viewports,
+    /// scissors and topology are set again here (the stencil reference is
+    /// left alone: the pass has no stencil). Nothing without a bound view
+    /// heap (logged once; the depth texture is left as it was).
+    pub(crate) fn sync_twin(&mut self, list: &HostList, resource: This) {
+        let Some(copy) = crate::twin::newer(resource) else {
+            return;
+        };
+        let Some((title, host)) = self.twin_heap(list) else {
+            once!("a depth twin's copy pass without a host view heap bound: not run");
+            return;
+        };
+        let Some(index) = crate::twin::sync(list, host, &copy) else {
+            return;
+        };
+        self.dynamic.push((title, index, 1));
+        // What the pass replaced.
+        self.host_pipeline = 0;
+        self.host_roots[0] = 0;
+        let (handles, depth) = (std::mem::take(&mut self.target_handles), self.depth_handle);
+        self.set_targets(list, &handles, depth);
+        if !self.viewports.is_empty() {
+            viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            scissors(list, &self.scissors);
+        }
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+    }
+
+    /// Copies the depth plane of title depth texture `resource` into its
+    /// twin if the twin is stale ([`crate::twin::refresh`]); the next
+    /// dispatch binds its compute root signature and pipeline again.
+    fn refresh_twin(&mut self, list: &HostList, resource: This) {
+        let Some(copy) = crate::twin::stale(resource) else {
+            return;
+        };
+        let Some((title, host)) = self.twin_heap(list) else {
+            once!("a depth twin's refresh without a host view heap bound: not run");
+            return;
+        };
+        let Some((first, n)) = crate::twin::refresh(list, host, &copy) else {
+            return;
+        };
+        self.dynamic.push((title, first, n));
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+    }
+
+    /// The bound view heap (title heap and its host heap), set on the list
+    /// if it is not yet, for a depth twin's pass.
+    fn twin_heap(
+        &mut self,
+        list: &HostList,
+    ) -> Option<(usize, &'static crate::descriptor::host::HostHeap)> {
+        let title = self.heaps[0];
+        let host = (title != 0)
+            .then(|| crate::descriptor::heap(title as This).host())
+            .flatten()?;
+        if self.host_heaps != self.heaps {
+            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+                .heaps
+                .iter()
+                .filter(|&&h| h != 0)
+                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .map(|h| Some(h.heap.clone()))
+                .collect();
+            heaps.iter().flatten().for_each(|h| list.keep(h));
+            // SAFETY: an open list and shader-visible heaps.
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            self.host_heaps = self.heaps;
+            self.host_roots = [0; 2];
+        }
+        Some((title, host))
+    }
+
+    /// Before a draw or dispatch with `p`: the depth textures its stages
+    /// read through shader views in tables whose twins are newer get the
+    /// twins' values ([`State::sync_twin`]); those they write through
+    /// unordered views whose twins are stale get their depth planes copied
+    /// into the twins ([`State::refresh_twin`]).
+    fn sync_twins(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let newer = crate::twin::any_newer();
+        let mut read = Vec::new();
+        let mut written = Vec::new();
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let wanted = match u.kind {
+                    ResourceType::Srv => newer,
+                    ResourceType::Uav => true,
+                    _ => false,
+                };
+                if u.root != RootType::Table || !wanted {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                if self.heap_of(handle).is_none() {
+                    continue;
+                }
+                match crate::descriptor::view(handle) {
+                    Some(View::Shader(resource, _)) => read.push(resource),
+                    Some(View::Unordered(resource, ..)) => written.push(resource),
+                    _ => {}
+                }
+            }
+        }
+        read.sort_unstable();
+        read.dedup();
+        for resource in read {
+            self.sync_twin(list, resource as This);
+        }
+        written.sort_unstable();
+        written.dedup();
+        for resource in written {
+            self.refresh_twin(list, resource as This);
+        }
     }
 
     /// The table of the root shader view at title `address` in `shadow`
@@ -1869,6 +2009,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            crate::twin::written(list, *resource as This);
         }
         _ => {}
     }
