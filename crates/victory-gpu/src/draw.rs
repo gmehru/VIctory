@@ -86,6 +86,15 @@ pub(crate) struct State {
     /// draws binding the same root view share one slot instead of taking
     /// one each.
     root_views: std::collections::HashMap<(usize, u64, u64), u32>,
+    /// The viewports, scissor rectangles and stencil reference last set on
+    /// the list (diagnostics: logged with the indirect executions of listed
+    /// frames; the host list gets them as the title sets them).
+    #[cfg(feature = "diagnostics")]
+    viewports: Vec<D3D12_VIEWPORT>,
+    #[cfg(feature = "diagnostics")]
+    scissors: Vec<RECT>,
+    #[cfg(feature = "diagnostics")]
+    stencil: u32,
 }
 
 impl Drop for State {
@@ -384,6 +393,25 @@ impl State {
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
         self.pipeline = pipeline as usize;
+    }
+
+    /// Keeps the viewports the title set, to log them (diagnostics; the
+    /// host list gets them through [`viewports`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_viewports(&mut self, viewports: &[D3D12_VIEWPORT]) {
+        self.viewports = viewports.to_vec();
+    }
+
+    /// As [`State::note_viewports`], for scissor rectangles.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_scissors(&mut self, rects: &[RECT]) {
+        self.scissors = rects.to_vec();
+    }
+
+    /// As [`State::note_viewports`], for the stencil reference.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_stencil_ref(&mut self, reference: u32) {
+        self.stencil = reference;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
@@ -1157,6 +1185,9 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn trace(&self, kind: &str, count: u32, first: u32) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
+        if !kind.starts_with("indirect") {
+            self.log_draw(kind, count);
+        }
         if !tracing::enabled!(tracing::Level::DEBUG) {
             return;
         }
@@ -1409,8 +1440,156 @@ impl State {
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// written them. False if it cannot run on the host. Diagnostics builds
+    /// trace the ones that ran (as draws are, [`State::trace`]) and log each
+    /// one of a listed frame ([`State::log_indirect`]).
     pub(crate) fn execute_indirect(
+        &mut self,
+        list: &HostList,
+        records: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let ran = self.run_indirect(list, records, arguments, count);
+        #[cfg(feature = "diagnostics")]
+        {
+            const DISPATCH: u32 = 2;
+            // After the run: the host pipeline is made if it ran, so the
+            // trace's lookup of it neither starts nor waits for one.
+            if ran && records.0 != DISPATCH {
+                self.trace(&format!("indirect kind {}", records.0), records.2, 0);
+            }
+            self.log_indirect(records, arguments, count, ran);
+        }
+        ran
+    }
+
+    /// For a frame [`crate::capture::listed`] (the one being recorded):
+    /// one line per indirect execution, whether it ran or not, with its
+    /// pipeline (its stages' hashes, as the host pipeline lines name it;
+    /// looked up without waiting for or starting its host pipeline), whether
+    /// its rectangles went through the geometry shader, the bound render
+    /// targets and depth by title resource (as the target dump files name
+    /// them, with size and format), the stencil reference, viewports and
+    /// scissor rectangles last set, and the records' max count and count
+    /// buffer.
+    #[cfg(feature = "diagnostics")]
+    fn log_indirect(&self, (kind, stride, max): (u32, u32, u32), arguments: u64, count: Option<u64>, ran: bool) {
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::listed(frame) {
+            return;
+        }
+        const DRAW: u32 = 0;
+        const INDEXED: u32 = 1;
+        let rectangles = matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES;
+        let gs = rectangles && crate::rects::on();
+        let expanded = rectangles && !gs && kind == DRAW && indirect_rectangles();
+        let resource = |r: usize| {
+            let r = r as This;
+            match crate::resource::host_resource(r) {
+                Some(t) => {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{r:?} {}x{} f{}", d.Width, d.Height, d.Format.0)
+                }
+                None => format!("{r:?} (no host copy)"),
+            }
+        };
+        let targets: Vec<String> = self.targets.iter().map(|&t| resource(t)).collect();
+        let depth = if self.depth == 0 {
+            "none".to_owned()
+        } else {
+            resource(self.depth)
+        };
+        let viewports: Vec<String> = self
+            .viewports
+            .iter()
+            .map(|v| {
+                format!(
+                    "{},{} {}x{} z{}..{}",
+                    v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth
+                )
+            })
+            .collect();
+        let scissors: Vec<String> = self
+            .scissors
+            .iter()
+            .map(|r| format!("{},{}..{},{}", r.left, r.top, r.right, r.bottom))
+            .collect();
+        let (pipeline, host) = crate::pipeline::describe(self.pipeline as This);
+        tracing::info!(
+            frame,
+            kind,
+            ran,
+            pipeline = %pipeline,
+            host_pipeline = %host,
+            topology = self.topology,
+            geometry_shader = gs,
+            expanded,
+            targets = ?targets,
+            depth = %depth,
+            stencil_ref = self.stencil,
+            viewports = ?viewports,
+            scissors = ?scissors,
+            max,
+            stride,
+            arguments = format_args!("{arguments:#x}"),
+            count_buffer = count.is_some(),
+            count_at = ?count.map(|c| format!("{c:#x}")),
+            "listed frame: indirect execution"
+        );
+    }
+
+    /// One line per direct draw of a frame listed for capture, before it is
+    /// prepared: its pipeline and the resources it draws into, as
+    /// [`State::log_indirect`] prints them. Says which draws write a target
+    /// that a later pass tests against.
+    #[cfg(feature = "diagnostics")]
+    fn log_draw(&self, kind: &str, count: u32) {
+        let frame = crate::queue::presented() + 1;
+        if !crate::capture::listed(frame) {
+            return;
+        }
+        let resource = |r: usize| {
+            let r = r as This;
+            match crate::resource::host_resource(r) {
+                Some(t) => {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{r:?} {}x{} f{}", d.Width, d.Height, d.Format.0)
+                }
+                None => format!("{r:?} (no host copy)"),
+            }
+        };
+        let targets: Vec<String> = self.targets.iter().map(|&t| resource(t)).collect();
+        let depth = if self.depth == 0 {
+            "none".to_owned()
+        } else {
+            resource(self.depth)
+        };
+        let scissors: Vec<String> = self
+            .scissors
+            .iter()
+            .map(|r| format!("{},{}..{},{}", r.left, r.top, r.right, r.bottom))
+            .collect();
+        let (pipeline, host) = crate::pipeline::describe(self.pipeline as This);
+        tracing::info!(
+            frame,
+            kind,
+            count,
+            pipeline = %pipeline,
+            host_pipeline = %host,
+            topology = self.topology,
+            targets = ?targets,
+            depth = %depth,
+            stencil_ref = self.stencil,
+            scissors = ?scissors,
+            "listed frame: draw"
+        );
+    }
+
+    /// [`State::execute_indirect`] itself.
+    fn run_indirect(
         &mut self,
         list: &HostList,
         (kind, stride, max): (u32, u32, u32),

@@ -1778,7 +1778,13 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         #[cfg(feature = "diagnostics")]
         let rects = crate::draw::take_rects();
-        if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+        // A listed frame among these: its statistics are logged whenever
+        // they come, with every drop reason.
+        #[cfg(feature = "diagnostics")]
+        let listed = crate::capture::take_listed();
+        #[cfg(not(feature = "diagnostics"))]
+        let listed = false;
+        if listed || self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
@@ -1791,10 +1797,24 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
+                // All of them with a listed frame among these frames, or
+                // when targets are dumped; else the first 40.
+                let shown = if listed || crate::capture::dump_on() {
+                    drops.len()
+                } else {
+                    40
+                };
+                for (why, n) in drops.iter().take(shown) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames
+                    );
+                }
+                if shown < drops.len() {
+                    tracing::info!(
+                        shown,
+                        reasons = drops.len(),
+                        "drop reasons not all listed (all with a listed capture frame or VICTORY_DUMP_TARGETS)"
                     );
                 }
                 // Buffer views whose buffer does not start on one of their

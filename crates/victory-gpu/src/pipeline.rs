@@ -98,6 +98,33 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// The console program's clip control, for the log ([`clip_text`]).
+    clip: Option<String>,
+}
+
+/// A vertex or mesh program's clip control as its stage data gives it:
+/// for mesh programs `PA_CL_VS_OUT_CNTL` (clip_cntl) with its clip
+/// distance enables (bits 0-7) and cull distance enables (bits 8-15); for
+/// vertex programs that register is not in the stage data as read
+/// ("not parsed"). Both with the number of clip-distance output rows the
+/// translation declares from the stage data.
+#[cfg(windows)]
+fn clip_text(io: &victory_shader::native::StageIo) -> Option<String> {
+    use victory_shader::native::{StageIo, Usage};
+    let rows = |outputs: &[victory_shader::native::VsOutput]| {
+        outputs.iter().filter(|o| o.usage == Usage::ClipDistance).count()
+    };
+    match io {
+        StageIo::Ms(ms) => Some(format!(
+            "clip_cntl={:#010x} clip_enable={:#04x} cull_enable={:#04x} clip_rows={}",
+            ms.clip_cntl,
+            ms.clip_cntl & 0xff,
+            ms.clip_cntl >> 8 & 0xff,
+            rows(&ms.outputs)
+        )),
+        StageIo::Vs { outputs, .. } => Some(format!("clip_cntl=not parsed clip_rows={}", rows(outputs))),
+        _ => None,
+    }
 }
 
 #[cfg(windows)]
@@ -114,6 +141,7 @@ impl Shader {
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
+                        clip = t.clip.as_deref().unwrap_or("none"),
                         "shader translated"
                     ),
                     Err(e) => tracing::warn!(
@@ -134,7 +162,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let (used, clip) = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -144,11 +172,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
             })
-            .map(|p| p.used)
+            .map(|p| (p.used, clip_text(&p.io)))
             .unwrap_or_default(),
-        None => Vec::new(),
+        None => (Vec::new(), None),
     };
-    Ok(Translated { host, used })
+    Ok(Translated { host, used, clip })
 }
 
 #[repr(C)]
@@ -281,6 +309,18 @@ pub(crate) fn note_drop(this: This) {
     if let Some(why) = why {
         note_why(why);
     }
+}
+
+/// A pipeline's name (its stages, as the host pipeline lines give it) and
+/// where its host pipelines are ([`make::status`]), without starting or
+/// waiting for them (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn describe(this: This) -> (String, String) {
+    if this.is_null() {
+        return ("no pipeline set".into(), String::new());
+    }
+    let p = pipeline(this);
+    (format!("{:?}", p.shaders), make::status(&p.host))
 }
 
 /// Counts a draw or dispatch dropped for `why` (diagnostics).

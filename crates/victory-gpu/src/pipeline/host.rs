@@ -518,7 +518,13 @@ impl HostPipeline {
                     return None;
                 }
             };
-            tracing::info!(?shaders, "host mesh pipeline");
+            tracing::info!(
+                ?shaders,
+                cull = g.rasterizer.CullMode.0,
+                front_ccw = g.rasterizer.FrontCounterClockwise.as_bool(),
+                output = %OutputState::of(&graphics_desc(&root, [D3D12_SHADER_BYTECODE::default(); 3], g)),
+                "host mesh pipeline"
+            );
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
@@ -556,7 +562,13 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(
+            ?shaders,
+            cull = g.rasterizer.CullMode.0,
+            front_ccw = g.rasterizer.FrontCounterClockwise.as_bool(),
+            output = %OutputState::of(&desc),
+            "host pipeline"
+        );
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -636,12 +648,15 @@ impl HostPipeline {
         let name = format!("{} with rectangles", self.name);
         // The title's face culling (1 none, 2 front, 3 back), whatever the
         // host does with it: what settles whether the console culls
-        // rectangle lists, if a pass stays black.
+        // rectangle lists, if a pass stays black. Then what the host
+        // pipeline gets ([`OutputState`]): whether its pixels can land.
         tracing::info!(
             pipeline = self.name,
             cull = g.rasterizer.CullMode.0,
             front_ccw = g.rasterizer.FrontCounterClockwise.as_bool(),
             culled,
+            host_cull = desc.RasterizerState.CullMode.0,
+            output = %OutputState::of(&desc),
             "host rectangle pipeline"
         );
         crate::host::name(&pso, || name.clone());
@@ -656,6 +671,125 @@ impl HostPipeline {
             name,
             library,
         })
+    }
+}
+
+/// What a host graphics pipeline's description says about where its pixels
+/// go, for the pipeline lines: depth and stencil test, sample mask, depth
+/// format, render target formats, render target 0's blend, samples and
+/// depth clip. Written as
+/// `depth=on write=ALL func=LESS stencil=off read=0xff write=0xff
+/// front=ALWAYS/KEEP/KEEP/KEEP back=… sample_mask=0xffffffff dsv=f40
+/// rtvs=[f10, f34] blend0=[on ONE+ONE ADD alpha ONE+ZERO ADD mask=0xf]
+/// samples=1 depth_clip=true` (stencil faces: func/fail/depth fail/pass;
+/// formats by DXGI number, as the dump file names give them).
+pub(crate) struct OutputState<'a>(&'a D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+
+impl<'a> OutputState<'a> {
+    pub(crate) fn of(desc: &'a D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> Self {
+        OutputState(desc)
+    }
+}
+
+/// A D3D12 enumeration value by name, or its number if not in `names`
+/// (indexed by value).
+fn named(names: &[&'static str], value: i32) -> String {
+    match usize::try_from(value).ok().and_then(|i| names.get(i)) {
+        Some(name) if !name.is_empty() => (*name).to_owned(),
+        _ => format!("{value}"),
+    }
+}
+
+const COMPARISONS: [&str; 9] = [
+    "NONE",
+    "NEVER",
+    "LESS",
+    "EQUAL",
+    "LESS_EQUAL",
+    "GREATER",
+    "NOT_EQUAL",
+    "GREATER_EQUAL",
+    "ALWAYS",
+];
+const STENCIL_OPS: [&str; 9] = [
+    "", "KEEP", "ZERO", "REPLACE", "INCR_SAT", "DECR_SAT", "INVERT", "INCR", "DECR",
+];
+const BLENDS: [&str; 22] = [
+    "",
+    "ZERO",
+    "ONE",
+    "SRC_COLOR",
+    "INV_SRC_COLOR",
+    "SRC_ALPHA",
+    "INV_SRC_ALPHA",
+    "DEST_ALPHA",
+    "INV_DEST_ALPHA",
+    "DEST_COLOR",
+    "INV_DEST_COLOR",
+    "SRC_ALPHA_SAT",
+    "",
+    "",
+    "BLEND_FACTOR",
+    "INV_BLEND_FACTOR",
+    "SRC1_COLOR",
+    "INV_SRC1_COLOR",
+    "SRC1_ALPHA",
+    "INV_SRC1_ALPHA",
+    "ALPHA_FACTOR",
+    "INV_ALPHA_FACTOR",
+];
+const BLEND_OPS: [&str; 6] = ["", "ADD", "SUBTRACT", "REV_SUBTRACT", "MIN", "MAX"];
+
+impl std::fmt::Display for OutputState<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let d = self.0;
+        let ds = &d.DepthStencilState;
+        let on = |b: windows::core::BOOL| if b.as_bool() { "on" } else { "off" };
+        let face = |s: &D3D12_DEPTH_STENCILOP_DESC| {
+            format!(
+                "{}/{}/{}/{}",
+                named(&COMPARISONS, s.StencilFunc.0),
+                named(&STENCIL_OPS, s.StencilFailOp.0),
+                named(&STENCIL_OPS, s.StencilDepthFailOp.0),
+                named(&STENCIL_OPS, s.StencilPassOp.0)
+            )
+        };
+        write!(
+            f,
+            "depth={} write={} func={} stencil={} read={:#04x} write={:#04x} front={} back={}",
+            on(ds.DepthEnable),
+            named(&["ZERO", "ALL"], ds.DepthWriteMask.0),
+            named(&COMPARISONS, ds.DepthFunc.0),
+            on(ds.StencilEnable),
+            ds.StencilReadMask,
+            ds.StencilWriteMask,
+            face(&ds.FrontFace),
+            face(&ds.BackFace)
+        )?;
+        let n = d.NumRenderTargets.min(8) as usize;
+        let rtvs: Vec<String> = d.RTVFormats[..n].iter().map(|r| format!("f{}", r.0)).collect();
+        let b = &d.BlendState.RenderTarget[0];
+        write!(
+            f,
+            " sample_mask={:#x} dsv=f{} rtvs=[{}] blend0=[{} {}+{} {} alpha {}+{} {} logic={} mask={:#x}] \
+             alpha_to_coverage={} independent_blend={} samples={} depth_clip={}",
+            d.SampleMask,
+            d.DSVFormat.0,
+            rtvs.join(", "),
+            on(b.BlendEnable),
+            named(&BLENDS, b.SrcBlend.0),
+            named(&BLENDS, b.DestBlend.0),
+            named(&BLEND_OPS, b.BlendOp.0),
+            named(&BLENDS, b.SrcBlendAlpha.0),
+            named(&BLENDS, b.DestBlendAlpha.0),
+            named(&BLEND_OPS, b.BlendOpAlpha.0),
+            on(b.LogicOpEnable),
+            b.RenderTargetWriteMask,
+            d.BlendState.AlphaToCoverageEnable.as_bool(),
+            d.BlendState.IndependentBlendEnable.as_bool(),
+            d.SampleDesc.Count,
+            d.RasterizerState.DepthClipEnable.as_bool()
+        )
     }
 }
 
@@ -859,6 +993,46 @@ fn root_signature(
 mod tests {
     use super::*;
     use victory_shader::emit::HostShader;
+
+    /// The pipeline lines' output state: a stencil-tested, equal-depth,
+    /// additive pass as a host description holds it.
+    #[test]
+    fn output_state_reads_as_words() {
+        let mut g = GraphicsState::default();
+        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        g.depth.StencilEnable = true.into();
+        g.depth.StencilWriteMask = 0;
+        g.depth.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_NOT_EQUAL;
+        g.depth.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        // As `graphics_desc` fills it, without a root signature.
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            BlendState: g.blend,
+            SampleMask: g.sample_mask,
+            RasterizerState: g.rasterizer,
+            DepthStencilState: g.depth,
+            NumRenderTargets: g.targets.NumRenderTargets,
+            RTVFormats: g.targets.RTFormats,
+            DSVFormat: g.depth_format,
+            SampleDesc: g.samples,
+            ..Default::default()
+        };
+        let text = OutputState::of(&desc).to_string();
+        assert_eq!(
+            text,
+            "depth=on write=ZERO func=EQUAL stencil=on read=0xff write=0x00 \
+             front=NOT_EQUAL/KEEP/KEEP/REPLACE back=ALWAYS/KEEP/KEEP/KEEP \
+             sample_mask=0xffffffff dsv=f20 rtvs=[f10, f34] \
+             blend0=[on ONE+ONE ADD alpha ONE+ZERO ADD logic=off mask=0xf] \
+             alpha_to_coverage=false independent_blend=false samples=1 depth_clip=true"
+        );
+    }
 
     /// Rectangle pipelines as [`HostPipeline::rects`] describes them, for
     /// hand-written output signatures: a vertex shader as translations emit

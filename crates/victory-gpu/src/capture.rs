@@ -122,6 +122,10 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     );
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
+    // The folder need not exist yet: a run lost its first capture to that.
+    if let Err(e) = std::fs::create_dir_all(folder) {
+        tracing::warn!(error = %e, folder = %folder.display(), "capture folder not made");
+    }
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
@@ -155,6 +159,17 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+    read_back_sub(device, list, texture, 0)
+}
+
+/// As [`read_back`], for subresource `sub` (a depth-stencil texture's
+/// stencil plane, say).
+fn read_back_sub(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    sub: u32,
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -162,7 +177,7 @@ pub(crate) fn read_back(
         let desc = texture.GetDesc();
         device.GetCopyableFootprints(
             &desc,
-            0,
+            sub,
             1,
             0,
             Some(&mut footprint),
@@ -213,7 +228,7 @@ pub(crate) fn read_back(
             pResource: std::mem::transmute_copy(texture),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
+                SubresourceIndex: sub,
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
@@ -260,10 +275,17 @@ pub(crate) fn save_read_back(
 static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
     std::sync::Mutex::new(Vec::new());
 
-fn dump_on() -> bool {
+pub(crate) fn dump_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
+
+/// Whether a listed frame was presented since the last call (the frame
+/// statistics then print every drop reason, not the first 40).
+pub(crate) fn take_listed() -> bool {
+    LISTED_SEEN.swap(false, Relaxed)
+}
+static LISTED_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
@@ -290,7 +312,13 @@ const DUMP_SMALLEST: u64 = 32;
 /// (the scene's before small passes'), until [`DUMP_BUDGET`] is spent; file
 /// names keep the first-use order. Logs how many were saved, how long it
 /// took and which one took longest, and which were left out for the budget.
+/// Each target not dumped for its kind or size, or not read, is logged
+/// with its description; float targets under [`DUMP_SMALLEST`] get their
+/// values logged ([`small_values`]); depth-stencil targets get their
+/// stencil plane saved too (`…-stencil.png`).
 pub(crate) fn dump_targets(frame: u64) {
+    // Called for listed frames only.
+    LISTED_SEEN.store(true, Relaxed);
     if !dump_on() {
         return;
     }
@@ -309,27 +337,54 @@ pub(crate) fn dump_targets(frame: u64) {
     // The target that took longest (ms, its number in the file names).
     let mut slowest = (0, None);
     for (i, d) in order {
+        let (resource, copy) = &targets[i];
+        let resource = *resource as crate::object::This;
+        let skipped = |why: &str| {
+            tracing::info!(
+                frame,
+                index = i,
+                ?resource,
+                why,
+                dimension = d.Dimension.0,
+                width = d.Width,
+                height = d.Height,
+                depth_or_array = d.DepthOrArraySize,
+                format = d.Format.0,
+                mips = d.MipLevels,
+                samples = d.SampleDesc.Count,
+                "listed frame: target not dumped"
+            );
+        };
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             not_2d += 1;
-            continue;
-        }
-        if d.Width < DUMP_SMALLEST || u64::from(d.Height) < DUMP_SMALLEST {
-            small += 1;
-            continue;
-        }
-        let (resource, copy) = &targets[i];
-        if started.elapsed() >= DUMP_BUDGET {
-            late.push(format!("{i:02} {resource:#x} {}x{} f{}", d.Width, d.Height, d.Format.0));
+            skipped("not_2d");
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        let resource = *resource as crate::object::This;
+        if d.Width < DUMP_SMALLEST || u64::from(d.Height) < DUMP_SMALLEST {
+            small += 1;
+            skipped("smaller_than_32");
+            if started.elapsed() < DUMP_BUDGET {
+                small_values(host, &copy.texture, state, frame, i, resource, &d);
+            }
+            continue;
+        }
+        if started.elapsed() >= DUMP_BUDGET {
+            late.push(format!("{i:02} {resource:?} {}x{} f{}", d.Width, d.Height, d.Format.0));
+            continue;
+        }
         let one = std::time::Instant::now();
         if dump_one(host, &copy.texture, state, frame, i, resource, &d) {
             dumped += 1;
         } else {
             not_read += 1;
+            skipped("not_read");
+        }
+        // The two-plane resource formats: R32G8X24_TYPELESS,
+        // D32_FLOAT_S8X24_UINT, R24G8_TYPELESS, D24_UNORM_S8_UINT.
+        if matches!(d.Format.0, 19 | 20 | 44 | 45) {
+            dump_stencil(host, &copy.texture, state, frame, i, resource, &d);
         }
         let ms = one.elapsed().as_millis();
         if ms >= slowest.0 {
@@ -369,7 +424,30 @@ fn dump_one(
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
 ) -> bool {
-    let Ok(list) = host.new_list() else { return false };
+    let Some((f, rows)) = read_rows(host, texture, state, 0) else { return false };
+    let pitch = f.RowPitch as usize;
+    let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, &rows);
+    if let Some(rgba) = &rgba {
+        let name = format!(
+            "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+            d.Width, d.Height, d.Format.0
+        );
+        save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, rgba);
+    } else {
+        tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+    }
+    rgba.is_some()
+}
+
+/// Subresource `sub` of `texture` (in host state `state`, moved to the
+/// copy source and back), read back: its footprint and rows.
+fn read_rows(
+    host: &crate::host::Host,
+    texture: &ID3D12Resource,
+    state: u32,
+    sub: u32,
+) -> Option<(D3D12_SUBRESOURCE_FOOTPRINT, Vec<u8>)> {
+    let list = host.new_list().ok()?;
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
@@ -378,7 +456,7 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back_sub(&host.device, &list.list, texture, sub);
         if state != copy {
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
@@ -387,28 +465,177 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return false };
+    let (buffer, footprint) = read?;
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return false;
-        }
-        let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
-        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
-        if let Some(rgba) = &rgba {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
-            );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, rgba);
-        } else {
-            tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
-        }
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        let len = f.RowPitch as usize * f.Height as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec();
         buffer.Unmap(0, None);
-        rgba.is_some()
+        Some((f, rows))
+    }
+}
+
+/// A depth-stencil target's stencil plane (plane slice 1, first mip and
+/// array slice), saved beside its depth as `…-stencil.png` (grey from the
+/// lowest value to the highest, as the 'target values' line gives them),
+/// and its values counted on a 'stencil values' line.
+fn dump_stencil(
+    host: &crate::host::Host,
+    texture: &ID3D12Resource,
+    state: u32,
+    frame: u64,
+    i: usize,
+    resource: crate::object::This,
+    d: &D3D12_RESOURCE_DESC,
+) {
+    let sub = u32::from(d.MipLevels.max(1)) * u32::from(d.DepthOrArraySize.max(1));
+    let Some((f, rows)) = read_rows(host, texture, state, sub) else {
+        tracing::info!(frame, index = i, ?resource, "listed frame: stencil not read");
+        return;
+    };
+    let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    // One byte a pixel (R8 footprints, the only stencil planes there are).
+    if matches!(f.Format.0, 60..=65) {
+        let counts = stencil_counts(w, h, pitch, &rows);
+        tracing::info!(
+            frame,
+            index = i,
+            ?resource,
+            width = w,
+            height = h,
+            footprint = f.Format.0,
+            counts = ?counts,
+            "listed frame: stencil values (value, pixels; most first)"
+        );
+    }
+    let Some(rgba) = to_rgba(f.Format.0 as u32, w, h, pitch, &rows) else {
+        tracing::info!(frame, index = i, ?resource, footprint = f.Format.0, "listed frame: stencil not dumped: format");
+        return;
+    };
+    let name = format!(
+        "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}-stencil",
+        d.Width, d.Height, d.Format.0
+    );
+    save_as(&name, f.Width, f.Height, w * 4, false, &rgba);
+}
+
+/// How many pixels of a one-byte plane hold each value, most first.
+fn stencil_counts(w: usize, h: usize, pitch: usize, rows: &[u8]) -> Vec<(u8, u64)> {
+    let mut counts = [0u64; 256];
+    for y in 0..h {
+        for &v in &rows[y * pitch..][..w] {
+            counts[usize::from(v)] += 1;
+        }
+    }
+    let mut out: Vec<(u8, u64)> = (0..=255u8)
+        .zip(counts)
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    out.sort_by_key(|&(v, n)| (std::cmp::Reverse(n), v));
+    out
+}
+
+/// Pixels whose values a small float target gets logged with, at most
+/// (16 x 16: exposure, luminance and tile grids).
+const SMALL_VALUES: usize = 256;
+
+/// A float target under [`DUMP_SMALLEST`] (first mip and slice): its
+/// values on a line, pixel by pixel in rows (at most [`SMALL_VALUES`]
+/// pixels; channels as the format has them), with the counts of
+/// [`float_counts`]. Other formats are left out.
+fn small_values(
+    host: &crate::host::Host,
+    texture: &ID3D12Resource,
+    state: u32,
+    frame: u64,
+    i: usize,
+    resource: crate::object::This,
+    d: &D3D12_RESOURCE_DESC,
+) {
+    if float_pixel(d.Format.0 as u32).is_none() {
+        return;
+    }
+    let Some((f, rows)) = read_rows(host, texture, state, 0) else {
+        tracing::info!(frame, index = i, ?resource, "listed frame: small target not read");
+        return;
+    };
+    let format = f.Format.0 as u32;
+    let Some(bytes) = float_pixel(format) else {
+        tracing::info!(frame, index = i, ?resource, footprint = format, "listed frame: small target not read: format");
+        return;
+    };
+    let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    let pixels: Vec<Vec<f32>> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| float_channels(format, &rows[y * pitch + x * bytes..][..bytes]))
+        .collect();
+    // Alpha included.
+    let counts = float_counts(&pixels);
+    let text = if w * h <= SMALL_VALUES {
+        pixels
+            .chunks(w.max(1))
+            .map(|row| {
+                row.iter()
+                    .map(|p| {
+                        let p: Vec<String> = p.iter().map(|v| format!("{v}")).collect();
+                        format!("({})", p.join(" "))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    } else {
+        format!("({} pixels: more than {SMALL_VALUES}, not listed)", w * h)
+    };
+    tracing::info!(
+        frame,
+        index = i,
+        ?resource,
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        footprint = format,
+        negative = counts.negative,
+        nan = counts.nan,
+        infinite = counts.infinite,
+        nonzero = counts.nonzero,
+        values = %text,
+        "listed frame: small target values (rows split by |)"
+    );
+}
+
+/// Bytes per pixel of a float format whose channels [`float_channels`]
+/// reads (typeless families read as floats, as the dumps show them).
+fn float_pixel(format: u32) -> Option<usize> {
+    Some(match format {
+        1..=2 => 16,
+        9..=10 | 15..=16 => 8,
+        26 | 33..=34 | 39..=41 => 4,
+        53..=54 => 2,
+        _ => return None,
+    })
+}
+
+/// A pixel of a format [`float_pixel`] takes, every channel it has.
+fn float_channels(format: u32, b: &[u8]) -> Vec<f32> {
+    let u16_at = |i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
+    let f32_at = |i: usize| f32::from_bits(u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]));
+    match format {
+        1..=2 => (0..4).map(f32_at).collect(),
+        9..=10 => (0..4).map(|i| half(u16_at(i))).collect(),
+        15..=16 => (0..2).map(f32_at).collect(),
+        26 => {
+            let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            vec![small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
+        }
+        33..=34 => (0..2).map(|i| half(u16_at(i))).collect(),
+        39..=41 => vec![f32_at(0)],
+        53..=54 => vec![half(u16_at(0))],
+        _ => Vec::new(),
     }
 }
 
@@ -416,6 +643,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -428,9 +656,52 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
+}
+
+/// Pixels of a float target with a channel below zero (-inf included), a
+/// NaN, an infinity, a value other than zero (NaN included): what its
+/// lowest and highest finite values do not tell ('high=0' holds for a
+/// target of zeros, of negatives and of NaN alike).
+#[derive(Debug, Default, PartialEq)]
+struct FloatCounts {
+    negative: u64,
+    nan: u64,
+    infinite: u64,
+    nonzero: u64,
+}
+
+fn float_counts<P: AsRef<[f32]>>(pixels: &[P]) -> FloatCounts {
+    let mut n = FloatCounts::default();
+    for p in pixels {
+        let p = p.as_ref();
+        n.negative += u64::from(p.iter().any(|&c| c < 0.0));
+        n.nan += u64::from(p.iter().any(|c| c.is_nan()));
+        n.infinite += u64::from(p.iter().any(|c| c.is_infinite()));
+        n.nonzero += u64::from(p.iter().any(|&c| c != 0.0));
+    }
+    n
+}
+
+/// How an integer format is shown ([`id_colour`]): channels, bytes a
+/// channel, signed.
+fn integer_layout(format: u32) -> Option<(usize, usize, bool)> {
+    Some(match format {
+        3 => (4, 4, false),
+        4 => (4, 4, true),
+        12 => (4, 2, false),
+        14 => (4, 2, true),
+        17 => (2, 4, false),
+        18 => (2, 4, true),
+        // R32_UINT and R32_SINT (R32_TYPELESS, D32_FLOAT and R32_FLOAT,
+        // 39 to 41, are floats: depth planes come as those).
+        42 => (1, 4, false),
+        43 => (1, 4, true),
+        _ => return None,
+    })
 }
 
 /// Rows of a host format as 8-bit RGBA: 8-bit color as is, wide integer
@@ -445,14 +716,9 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // Integers, four or two channels of 32 or 16 bits (ids: a visibility
     // buffer's triangle and instance, say): a colour per value, zero black.
     // Scaled by the largest, all but the largest ids would look black.
-    let integers = match format {
-        3 | 4 => Some((4, 4)),
-        12 | 14 => Some((4, 2)),
-        17 | 18 => Some((2, 4)),
-        _ => None,
-    };
-    if let Some((channels, bytes)) = integers {
-        let (mut low, mut high, mut nonzero) = (u32::MAX, 0, 0u64);
+    if let Some((channels, bytes, signed)) = integer_layout(format) {
+        // Lowest and highest channel values (signed formats as such).
+        let (mut low, mut high, mut nonzero) = (i64::MAX, i64::MIN, 0u64);
         for y in 0..h {
             for x in 0..w {
                 let p = px(x, y, channels * bytes);
@@ -462,6 +728,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
                     (true, _) => u32::from(u16_at(p, c)),
                 });
                 for &c in &v[..channels] {
+                    let c = match (signed, bytes) {
+                        (false, _) => i64::from(c),
+                        (true, 4) => i64::from(c as i32),
+                        (true, _) => i64::from(c as u16 as i16),
+                    };
                     (low, high) = (low.min(c), high.max(c));
                 }
                 nonzero += u64::from(v != [0; 4]);
@@ -513,8 +784,9 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
-        // Single channels (and depth planes): shown as grey.
-        39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        // Single channels (and depth planes): shown as grey (42 and 43,
+        // R32_UINT and R32_SINT, are integers, above).
+        39..=41 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
         44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
@@ -526,7 +798,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=41 | 44..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
@@ -534,9 +806,20 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         (0.0, finite.fold(0.0f32, f32::max))
     };
     let range = (high - low).max(1e-20);
-    tracing::info!(format, low, high, "target values");
+    let n = float_counts(&values);
+    tracing::info!(
+        format,
+        low,
+        high,
+        negative = n.negative,
+        nan = n.nan,
+        infinite = n.infinite,
+        nonzero = n.nonzero,
+        "target values"
+    );
     for v in values {
-        let c = v.map(|c| (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8);
+        // NaN white, as +inf: seen, not taken for zero.
+        let c = v.map(|c| if c.is_nan() { 255 } else { (((c - low) / range).clamp(0.0, 1.0) * 255.0) as u8 });
         out.extend([c[0], c[1], c[2], 255]);
     }
     Some(out)
@@ -725,6 +1008,91 @@ mod tests {
         let rgba = super::to_rgba(R16G16B16A16_UINT, 2, 1, rows.len(), &rows).unwrap();
         assert_eq!(rgba[..4], [0, 0, 0, 255]);
         assert_ne!(rgba[4..], [0, 0, 0, 255]);
+    }
+
+    /// R32_UINT and R32_SINT are integers (a colour per value, zero
+    /// black), not floats; R32_TYPELESS, D32_FLOAT and R32_FLOAT stay
+    /// floats (grey from lowest to highest).
+    #[test]
+    fn r32_integer_targets_decode_as_integers() {
+        assert_eq!(super::integer_layout(42), Some((1, 4, false)));
+        assert_eq!(super::integer_layout(43), Some((1, 4, true)));
+        for float in 39..=41 {
+            assert_eq!(super::integer_layout(float), None);
+        }
+        let rows: Vec<u8> = [0u32, 7, 7, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rgba = super::to_rgba(42, 4, 1, rows.len(), &rows).unwrap();
+        let p: Vec<&[u8]> = rgba.chunks(4).collect();
+        assert_eq!(p[0], [0, 0, 0, 255]);
+        assert_eq!(p[1], super::id_colour([7, 0, 0, 0]));
+        assert_eq!(p[1], p[2]);
+        assert_ne!(p[1], p[3]);
+        let rows: Vec<u8> = [0i32, -1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rgba = super::to_rgba(43, 2, 1, rows.len(), &rows).unwrap();
+        assert_eq!(rgba[4..], super::id_colour([u32::MAX, 0, 0, 0]));
+        // R32_FLOAT: 0.0 black, 1.0 white.
+        let rows: Vec<u8> = [0.0f32, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let rgba = super::to_rgba(41, 2, 1, rows.len(), &rows).unwrap();
+        assert_eq!(rgba, [0, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    /// Negative, NaN and infinite values are counted by pixel; half and
+    /// small floats with a mantissa at the top exponent are NaN, shown
+    /// white.
+    #[test]
+    fn float_targets_count_negatives_nan_and_infinities() {
+        let (inf, nan) = (f32::INFINITY, f32::NAN);
+        let pixels = [
+            [0.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [nan, 0.0, 0.0],
+            [inf, 0.0, 0.0],
+            [1.0, 2.0, 0.0],
+            [-inf, 0.0, 0.0],
+            [-0.0, 0.0, 0.0],
+        ];
+        let n = super::float_counts(&pixels);
+        assert_eq!(
+            n,
+            super::FloatCounts {
+                negative: 2,
+                nan: 1,
+                infinite: 2,
+                nonzero: 5
+            }
+        );
+        assert!(super::half(0x7e00).is_nan());
+        assert!(super::half(0xfe00).is_nan());
+        assert_eq!(super::half(0x7c00), inf);
+        assert_eq!(super::half(0xfc00), -inf);
+        assert_eq!(super::half(0xbc00), -1.0);
+        assert!(super::small_float(0x7c0 | 1, 6).is_nan());
+        assert_eq!(super::small_float(0x7c0, 6), inf);
+        // R16G16B16A16_FLOAT: a NaN pixel white, a negative one black.
+        let rows: Vec<u8> = [[0x7e00u16, 0, 0, 0], [0xbc00, 0xbc00, 0xbc00, 0], [0x3c00, 0x3c00, 0x3c00, 0]]
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let rgba = super::to_rgba(10, 3, 1, rows.len(), &rows).unwrap();
+        assert_eq!(rgba[..4], [255, 0, 0, 255]);
+        assert_eq!(rgba[4..8], [0, 0, 0, 255]);
+        assert_eq!(rgba[8..], [255, 255, 255, 255]);
+        // Small targets' values: every channel the format has.
+        let pixel: Vec<u8> = [0x3c00u16, 0xbc00, 0, 0x7e00].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let channels = super::float_channels(10, &pixel);
+        assert_eq!(channels[..3], [1.0, -1.0, 0.0]);
+        assert!(channels[3].is_nan());
+        assert_eq!(super::float_pixel(10), Some(8));
+        assert_eq!(super::float_pixel(42), None);
+    }
+
+    /// A stencil plane's values, most pixels first.
+    #[test]
+    fn stencil_values_are_counted() {
+        // Two rows of three, pitch 4.
+        let rows = [1, 1, 0, 9, 1, 2, 2, 9];
+        assert_eq!(super::stencil_counts(3, 2, 4, &rows), [(1, 3), (2, 2), (0, 1)]);
     }
 
     /// `VICTORY_CAPTURE_AFTER` offsets count from the first world frame,

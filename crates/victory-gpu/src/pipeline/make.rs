@@ -95,6 +95,22 @@ impl Pending {
     }
 }
 
+/// Where a pipeline's host pipeline and rectangle pipeline are, without
+/// starting or waiting for either (diagnostics): "made", else [`missing`]'s
+/// reason; then "+ rectangles made", "+ rectangles being made or not asked
+/// for", or why it has none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn status(p: &Pending) -> String {
+    let host = missing(p).unwrap_or_else(|| "made".into());
+    let rects = match p.rects.get() {
+        Some(Ok(_)) => "rectangles made",
+        Some(Err(why)) => why,
+        None if p.rects_queued.load(Ordering::Relaxed) => "rectangles being made",
+        None => "no rectangle pipeline asked for",
+    };
+    format!("{host} + {rects}")
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]

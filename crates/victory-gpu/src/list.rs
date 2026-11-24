@@ -938,11 +938,15 @@ mod state {
         if let Some(list) = host_list(this) {
             crate::draw::viewports(list, items(viewports, count));
         }
+        #[cfg(feature = "diagnostics")]
+        with_state(this, |_, s| s.note_viewports(items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
         if let Some(list) = host_list(this) {
             crate::draw::scissors(list, items(rects, count));
         }
+        #[cfg(feature = "diagnostics")]
+        with_state(this, |_, s| s.note_scissors(items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
         if let Some(list) = host_list(this) {
@@ -954,6 +958,8 @@ mod state {
         if let Some(list) = host_list(this) {
             crate::draw::stencil_ref(list, reference);
         }
+        #[cfg(feature = "diagnostics")]
+        with_state(this, |_, s| s.note_stencil_ref(reference));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
