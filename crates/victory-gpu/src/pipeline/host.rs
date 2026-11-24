@@ -628,7 +628,20 @@ impl HostPipeline {
         if !culled {
             desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         }
-        let faces = if culled { "" } else { "cull none" };
+        let mut faces = if culled { "" } else { "cull none" }.to_owned();
+        // An experiment (diagnostics builds, VICTORY_RECT_DEPTH_ALWAYS=1):
+        // rectangle pipelines that test depth for equality pass everywhere
+        // instead. Wrong pictures on purpose: it says whether such a pass
+        // (the tiled lighting) writes nothing because of its depth test or
+        // because of what its shaders read.
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_RECT_DEPTH_ALWAYS").is_some_and(|v| v == "1")
+            && desc.DepthStencilState.DepthFunc == D3D12_COMPARISON_FUNC_EQUAL
+        {
+            desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            faces.push_str(" depth always");
+        }
+        let faces = faces.as_str();
         let library = super::library::name("rectangles", self.library.as_bytes(), &[&gs], faces);
         let made = super::library::pipeline(
             &library,
