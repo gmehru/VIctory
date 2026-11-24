@@ -8579,7 +8579,16 @@ impl<'a> Lower<'a> {
         // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
         // lowering accepts what it refuses when the same value is read directly. (So a dword known in part stays
         // so through every join on the way to a read, not only the last.)
-        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        // An experiment, unsound on purpose (VICTORY_PHI_OLD=1): the closure is skipped, as before upstream's
+        // 3dd467c, to see what the programs it refuses (the tiled lighting's CS_PrescalarizeLightLoop among them)
+        // did for the picture. Not for a build anyone keeps: the shader cache does not know about it.
+        static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let old = *OLD.get_or_init(|| std::env::var_os("VICTORY_PHI_OLD").is_some_and(|v| v == "1"));
+        let mut work: Vec<Value> = if old {
+            Vec::new()
+        } else {
+            self.read_phis.iter().copied().collect()
+        };
         while let Some(v) = work.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
