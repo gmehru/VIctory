@@ -58,6 +58,10 @@ pub(crate) struct Staging {
     used: std::sync::atomic::AtomicU64,
 }
 
+/// How long a texture found written behind its guard is hashed at every
+/// check ([`Last::hot`]).
+const HOT_FRAMES: u64 = 120;
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
@@ -66,6 +70,10 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Hashed at every check until this frame: the hash found a write the
+    /// guard did not see (one through another view of the texture's pages,
+    /// as the title's video decoder makes).
+    hot: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -646,6 +654,7 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        let mut blind = false;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
@@ -653,10 +662,12 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            if unwritten && !turn && frame >= last.hot {
                 return 0;
             }
+            blind = unwritten;
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -718,6 +729,9 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                if blind && last.hash.is_some() {
+                    last.hot = crate::frame::current() + HOT_FRAMES;
+                }
                 last.hash = Some(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -733,6 +747,9 @@ impl Staging {
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
+        }
+        if blind && last.hash.is_some() {
+            last.hot = crate::frame::current() + HOT_FRAMES;
         }
         last.hash = Some(hash);
         self.detile(tiled);
